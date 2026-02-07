@@ -29,7 +29,9 @@ jobs:
           if [ "${{ github.event_name }}" = "push" ]; then
             BASE="${{ github.event.before }}"
           else
-            BASE="origin/${{ github.event.pull_request.base.ref }}"
+            # Use the exact base SHA from the event payload — stable regardless
+            # of base branch movement (avoids origin/<ref> drift).
+            BASE="${{ github.event.pull_request.base.sha }}"
           fi
 
           # Fail-safe: if we can't diff, assume non-docs (run everything)
