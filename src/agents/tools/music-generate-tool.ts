@@ -606,7 +606,7 @@ export function createMusicGenerateTool(options?: {
     name: "music_generate",
     displaySummary: "Generate music",
     description:
-      'Create audio/music for song, jingle, beat, loop, soundtrack, anthem, instrumental requests. If user asks make/generate/create song/music, call music_generate; do not just write lyrics unless lyrics/text only. Prompt gets style/genre/mood/tempo/instruments/purpose. lyrics only exact sung words. Session chats: background task; do not call again for same request; wait completion, then report through the current visible-reply contract with generated media attached using structured media fields. "status" checks active task.',
+      'Create audio/music for song, jingle, beat, loop, soundtrack, anthem, instrumental requests. If user asks make/generate/create song/music, first gather missing style/genre/mood, lyric theme, vocal/instrumental, and length details when needed; write or refine lyrics before generation; send a brief progress update while drafting. For vocal songs, show the lyrics and ask for confirmation before calling music_generate unless the user explicitly says to generate immediately. Prompt gets style/genre/mood/tempo/instruments/purpose. lyrics only exact sung words. Session chats: after calling music_generate, treat it as a background task; do not call again for same request; send status updates with action=status if asked or if generation is taking noticeable time; wait completion, then report through the current visible-reply contract with generated media attached using structured media fields. "status" checks active task.',
     parameters: MusicGenerateToolSchema,
     execute: async (_toolCallId, rawArgs) => {
       const args = rawArgs as Record<string, unknown>;

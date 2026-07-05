@@ -249,7 +249,7 @@ describe("createMusicGenerateTool", () => {
     );
   });
 
-  it("tells song requests to generate audio instead of only lyrics", () => {
+  it("tells song requests to draft lyrics before generating audio", () => {
     const tool = expectMusicGenerateTool(
       createMusicGenerateTool({
         config: asConfig({
@@ -262,8 +262,9 @@ describe("createMusicGenerateTool", () => {
       }),
     );
 
-    expect(tool.description).toContain("call music_generate");
-    expect(tool.description).toContain("do not just write lyrics");
+    expect(tool.description).toContain("write or refine lyrics before generation");
+    expect(tool.description).toContain("ask for confirmation before calling music_generate");
+    expect(tool.description).toContain("send status updates with action=status");
     expect(JSON.stringify(tool.parameters)).toContain("For song/style requests, use prompt");
   });
 
