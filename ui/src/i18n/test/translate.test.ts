@@ -98,7 +98,9 @@ describe("i18n", () => {
   });
 
   it("should replace parameters correctly", () => {
-    expect(translate.t("overview.stats.cronNext", { time: "10:00" })).toBe("Next wake 10:00");
+    expect(translate.t("connection.help.copyCommandAria", { command: "openclaw dashboard" })).toBe(
+      "Copy command: openclaw dashboard",
+    );
   });
 
   it("should fallback to English if key is missing in another locale", async () => {
@@ -208,6 +210,16 @@ describe("i18n", () => {
     const checkedKeys = flatten(en).filter(
       (key) => key.startsWith("nodes.pairing.") && key !== "nodes.pairing.title",
     );
+
+    for (const [locale, value] of Object.entries(shippedLocales)) {
+      for (const key of checkedKeys) {
+        expect(readString(value, key), `${locale}:${key}`).not.toBe(readString(en, key));
+      }
+    }
+  });
+
+  it("keeps new chat composer commands localized in shipped locale bundles", () => {
+    const checkedKeys = ["chat.composer.addAttachment", "chat.composer.attachFileOption"];
 
     for (const [locale, value] of Object.entries(shippedLocales)) {
       for (const key of checkedKeys) {

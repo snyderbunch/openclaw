@@ -81,7 +81,7 @@ type PageDiagnostics = {
 };
 
 function jobTitle(page: Page, name: string) {
-  return page.locator(".cron-job .list-title", { hasText: new RegExp(`^${name}$`, "u") });
+  return page.locator(".cron-task__name-text", { hasText: new RegExp(`^${name}$`, "u") });
 }
 
 async function waitForJobTitle(
@@ -204,7 +204,7 @@ describeControlUiE2e("Control UI cron mocked Gateway E2E", () => {
         sortDir: "asc",
       });
 
-      await page.locator("details.cron-filter-panel").first().locator("summary").click();
+      await page.locator("details.cron-filter-popover > summary").click();
       await page.locator('[data-test-id="cron-jobs-schedule-filter"]').selectOption("cron");
       await page.locator('[data-test-id="cron-jobs-last-status-filter"]').selectOption("unknown");
 
@@ -224,6 +224,67 @@ describeControlUiE2e("Control UI cron mocked Gateway E2E", () => {
       });
       await waitForJobTitle(page, gateway, { consoleMessages, pageErrors }, "Nightly cron pending");
       await expect.poll(async () => jobTitle(page, "Digest every minute").count()).toBe(0);
+    } finally {
+      await context.close();
+    }
+  });
+
+  it("saves and displays agent-turn model overrides", async () => {
+    const configuredModel = "openai/gpt-5.2";
+    const existingJob = {
+      ...cronJob("model-job", "Model-specific job", { kind: "every", everyMs: 60_000 }),
+      sessionTarget: "isolated",
+      wakeMode: "now",
+      payload: { kind: "agentTurn", message: "Use the configured model", model: configuredModel },
+    };
+    const context = await browser.newContext({
+      locale: "en-US",
+      serviceWorkers: "block",
+      viewport: { height: 900, width: 1280 },
+    });
+    const page = await context.newPage();
+    const gateway = await installMockGateway(page, {
+      methodResponses: {
+        "cron.add": { id: "quick-created-model-job" },
+        "cron.list": cronListResponse([existingJob]),
+        "cron.runs": { entries: [], total: 0, offset: 0, limit: 50, hasMore: false },
+        "cron.status": { enabled: true, jobs: 1, nextWakeAtMs: null },
+      },
+    });
+
+    try {
+      await page.goto(`${server.baseUrl}cron`);
+      await jobTitle(page, existingJob.name).waitFor({ timeout: 10_000 });
+
+      // Selecting the task loads its stored model override into the editor.
+      await jobTitle(page, existingJob.name).click();
+      await expect
+        .poll(async () => page.locator("#cron-payload-model").inputValue())
+        .toBe(configuredModel);
+
+      await page.locator('[data-test-id="cron-new-task"]').click();
+      await page.locator("#cron-payload-text").fill("Run with a selected model");
+      await page.locator("#cron-name").fill("Model override task");
+
+      const modelInput = page.locator("#cron-payload-model");
+      await modelInput.fill("openai/gpt-5.5");
+      expect(await modelInput.getAttribute("list")).toBe("cron-model-suggestions");
+      expect(
+        await page
+          .locator("#cron-model-suggestions option")
+          .evaluateAll((options) => options.map((option) => option.getAttribute("value"))),
+      ).toContain(configuredModel);
+
+      await page.locator('[data-test-id="cron-submit"]').click();
+      const addRequest = await gateway.waitForRequest("cron.add");
+      expect(requestParams(addRequest)).toMatchObject({
+        name: "Model override task",
+        payload: {
+          kind: "agentTurn",
+          message: "Run with a selected model",
+          model: "openai/gpt-5.5",
+        },
+      });
     } finally {
       await context.close();
     }

@@ -242,7 +242,7 @@ const invalidRequestCases = [
   },
   {
     name: "description exceeding max length",
-    params: { title: "T", description: "x".repeat(257) },
+    params: { title: "T", description: "x".repeat(513) },
   },
   {
     name: "timeoutMs exceeding max",
@@ -448,7 +448,7 @@ describe("createPluginApprovalHandlers", () => {
         {
           title: "T",
           description: "D",
-          allowedDecisions: ["allow-once", "deny", "allow-once"],
+          allowedDecisions: ["allow-once", "allow-once"],
           twoPhase: true,
         },
         { respond },

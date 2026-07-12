@@ -308,7 +308,7 @@ function normalizeFailoverDetailString(value: string | undefined): string | unde
     return undefined;
   }
   return trimmed.length > MAX_FAILOVER_DETAIL_CHARS
-    ? trimmed.slice(0, MAX_FAILOVER_DETAIL_CHARS)
+    ? truncateUtf16Safe(trimmed, MAX_FAILOVER_DETAIL_CHARS)
     : trimmed;
 }
 
@@ -1582,12 +1582,12 @@ export function formatAssistantErrorText(
 
   // Never return raw unhandled errors - log for debugging but return safe message
   if (raw.length > 600) {
-    log.warn(`Long error truncated: ${raw.slice(0, 200)}`);
+    log.warn(`Long error truncated: ${truncateUtf16Safe(raw, 200)}`);
   }
   return raw.length > 600 ? `${truncateUtf16Safe(raw, 600)}…` : raw;
 }
 
-export function isRawAssistantErrorPassthrough(params: {
+function isRawAssistantErrorPassthrough(params: {
   friendlyError?: string;
   rawError?: string;
 }): boolean {
@@ -1653,7 +1653,7 @@ const IMAGE_DIMENSION_ERROR_RE =
 const IMAGE_DIMENSION_PATH_RE = /messages\.(\d+)\.content\.(\d+)\.image/i;
 const IMAGE_SIZE_ERROR_RE = /image exceeds\s*(\d+(?:\.\d+)?)\s*mb/i;
 
-export function isMissingToolCallInputError(raw: string): boolean {
+function isMissingToolCallInputError(raw: string): boolean {
   if (!raw) {
     return false;
   }

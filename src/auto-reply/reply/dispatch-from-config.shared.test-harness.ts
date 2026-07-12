@@ -105,6 +105,7 @@ const pluginConversationBindingMocks = vi.hoisted(() => ({
 const sessionStoreMocks = vi.hoisted(() => ({
   currentEntry: undefined as Record<string, unknown> | undefined,
   loadSessionEntry: vi.fn((..._args: unknown[]) => sessionStoreMocks.currentEntry),
+  loadSessionStoreEntry: vi.fn(() => sessionStoreMocks.currentEntry),
   loadSessionStore: vi.fn(() => ({})),
   readSessionEntry: vi.fn(() => sessionStoreMocks.currentEntry),
   resolveStorePath: vi.fn(() => "/tmp/mock-sessions.json"),
@@ -124,11 +125,28 @@ const sessionStoreMocks = vi.hoisted(() => ({
       return sessionStoreMocks.currentEntry;
     },
   ),
+  updateSessionEntry: vi.fn(
+    async (
+      _scope: unknown,
+      update: (entry: Record<string, unknown>) => Promise<Record<string, unknown> | null>,
+    ) => {
+      if (!sessionStoreMocks.currentEntry) {
+        return null;
+      }
+      const patch = await update(sessionStoreMocks.currentEntry);
+      if (!patch) {
+        return sessionStoreMocks.currentEntry;
+      }
+      sessionStoreMocks.currentEntry = { ...sessionStoreMocks.currentEntry, ...patch };
+      return sessionStoreMocks.currentEntry;
+    },
+  ),
 }));
 const acpManagerRuntimeMocks = vi.hoisted(() => ({
   getAcpSessionManager: vi.fn(),
 }));
 const agentEventMocks = vi.hoisted(() => ({
+  emitAgentAuditEvent: vi.fn(),
   emitAgentEvent: vi.fn(),
   onAgentEvent: vi.fn<(listener: unknown) => () => void>(() => () => {}),
 }));
@@ -239,10 +257,16 @@ vi.mock("../../config/sessions/session-accessor.js", async (importOriginal) => {
   return {
     ...actual,
     loadSessionEntry: (...args: unknown[]) => sessionStoreMocks.loadSessionEntry(...args),
+    updateSessionEntry: (scope: unknown, update: unknown) =>
+      sessionStoreMocks.updateSessionEntry(
+        scope,
+        update as Parameters<typeof sessionStoreMocks.updateSessionEntry>[1],
+      ),
   };
 });
 vi.mock("./dispatch-from-config.runtime.js", () => ({
   createInternalHookEvent: internalHookMocks.createInternalHookEvent,
+  loadSessionStoreEntry: sessionStoreMocks.loadSessionStoreEntry,
   loadSessionStore: sessionStoreMocks.loadSessionStore,
   readSessionEntry: sessionStoreMocks.readSessionEntry,
   resolveSessionStoreEntry: sessionStoreMocks.resolveSessionStoreEntry,
@@ -285,6 +309,7 @@ vi.mock("../../infra/outbound/session-binding-service.js", () => ({
   }),
 }));
 vi.mock("../../infra/agent-events.js", () => ({
+  emitAgentAuditEvent: (params: unknown) => agentEventMocks.emitAgentAuditEvent(params),
   emitAgentEvent: (params: unknown) => agentEventMocks.emitAgentEvent(params),
   onAgentEvent: (listener: unknown) => agentEventMocks.onAgentEvent(listener),
 }));
