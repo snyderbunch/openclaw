@@ -4,10 +4,11 @@ import { formatErrorMessage } from "../infra/errors.js";
 import { logWarn } from "../logger.js";
 import { completeDeferredSessionMcpRuntimeRetirement } from "./agent-bundle-mcp-runtime.js";
 import type { SessionMcpRuntime } from "./agent-bundle-mcp-types.js";
+import { clearMcpAppModelContextForView } from "./mcp-app-model-context.js";
 import { type McpAppCsp, normalizeMcpAppCsp } from "./mcp-app-sandbox.js";
 
-export const MCP_APP_RESOURCE_MIME_TYPE = "text/html;profile=mcp-app";
-export const MCP_APP_RESOURCE_MAX_BYTES = 2 * 1024 * 1024;
+const MCP_APP_RESOURCE_MIME_TYPE = "text/html;profile=mcp-app";
+const MCP_APP_RESOURCE_MAX_BYTES = 2 * 1024 * 1024;
 const MCP_APP_VIEW_TTL_MS = 10 * 60_000;
 const MCP_APP_VIEW_MAX_ENTRIES = 32;
 const MCP_APP_VIEW_MAX_BYTES = 6 * 1024 * 1024;
@@ -28,6 +29,8 @@ export type McpAppViewLease = {
   html: string;
   csp?: McpAppCsp;
   permissions?: McpAppPermissions;
+  allowedAppToolNames?: ReadonlySet<string>;
+  readOnly?: true;
   toolInput: unknown;
   toolResult: CallToolResult;
   expiresAtMs: number;
@@ -39,6 +42,24 @@ export type McpAppViewLease = {
   expiryTimer?: ReturnType<typeof setTimeout>;
   releaseRuntimeLease?: () => void;
 };
+
+export type McpAppChannelView = {
+  viewId: string;
+};
+
+/** Retain only the bounded view identity needed for late channel materialization. */
+export function readMcpAppChannelView(result: unknown): McpAppChannelView | undefined {
+  const details = asRecord(asRecord(result)?.details);
+  const preview = asRecord(details?.mcpAppPreview);
+  const view = asRecord(preview?.view);
+  const descriptor = asRecord(preview?.mcpApp);
+  const viewId = typeof descriptor?.viewId === "string" ? descriptor.viewId.trim() : "";
+  const projectedViewId = typeof view?.id === "string" ? view.id.trim() : "";
+  if (!viewId || projectedViewId !== viewId) {
+    return undefined;
+  }
+  return { viewId };
+}
 
 type McpAppViewStore = Map<string, McpAppViewLease>;
 
@@ -60,6 +81,7 @@ function deleteView(viewId: string, expected?: McpAppViewLease): void {
     return;
   }
   clearTimeout(view.expiryTimer);
+  clearMcpAppModelContextForView(view.runtime, view);
   view.releaseRuntimeLease?.();
   store.delete(viewId);
   void completeDeferredSessionMcpRuntimeRetirement(view.runtime).catch((error: unknown) => {
@@ -102,6 +124,27 @@ function measureViewBytes(html: string, toolInput: unknown, toolResult: CallTool
     throw new Error(`MCP App view data exceeds ${MCP_APP_VIEW_MAX_BYTES} bytes`);
   }
   return byteSize;
+}
+
+function assertBoundedViewDescriptor(value: {
+  viewId?: string;
+  serverName: string;
+  toolName: string;
+  uiResourceUri: string;
+  toolCallId?: string;
+}): void {
+  if (
+    (value.viewId && (value.viewId.length > 128 || !value.viewId.startsWith("mcp-app-"))) ||
+    !value.serverName ||
+    value.serverName.length > 256 ||
+    !value.toolName ||
+    value.toolName.length > 256 ||
+    !value.uiResourceUri.startsWith("ui://") ||
+    value.uiResourceUri.length > 2_048 ||
+    (value.toolCallId !== undefined && value.toolCallId.length > 512)
+  ) {
+    throw new Error("MCP App preview descriptor exceeds safe limits");
+  }
 }
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
@@ -150,15 +193,24 @@ async function resolveListingUiMeta(
   serverName: string,
   uri: string,
 ): Promise<Record<string, unknown> | undefined> {
-  const listed = await runtime.listResources?.(serverName);
-  const resources = Array.isArray(listed)
-    ? listed
-    : Array.isArray(asRecord(listed)?.resources)
-      ? (asRecord(listed)?.resources as unknown[])
-      : [];
-  const resource = resources.map(asRecord).find((entry) => entry?.uri === uri);
-  const { _meta: metadata } = resource ?? {};
-  return asRecord(asRecord(metadata)?.ui);
+  try {
+    const listed = await runtime.listResources?.(serverName, { failureBackoff: "ignore" });
+    const resources = Array.isArray(listed)
+      ? listed
+      : Array.isArray(asRecord(listed)?.resources)
+        ? (asRecord(listed)?.resources as unknown[])
+        : [];
+    const resource = resources.map(asRecord).find((entry) => entry?.uri === uri);
+    const { _meta: metadata } = resource ?? {};
+    return asRecord(asRecord(metadata)?.ui);
+  } catch (error) {
+    // UI resources may be omitted from resources/list. Listing metadata is only
+    // a fallback, so its failure must not discard valid resources/read content.
+    logWarn(
+      `mcp-app: failed to read optional listing metadata for ${uri} from "${serverName}": ${formatErrorMessage(error)}`,
+    );
+    return undefined;
+  }
 }
 
 export async function fetchMcpAppView(params: {
@@ -166,16 +218,33 @@ export async function fetchMcpAppView(params: {
   serverName: string;
   toolName: string;
   uiResourceUri: string;
+  toolCallId?: string;
   toolInput: unknown;
   toolResult: CallToolResult;
-}): Promise<{ viewId: string; title: string } | undefined> {
+  allowedAppToolNames?: ReadonlySet<string>;
+  readOnly?: true;
+  viewId?: string;
+}): Promise<
+  | {
+      viewId: string;
+      title: string;
+      serverName: string;
+      toolName: string;
+      uiResourceUri: string;
+      toolCallId?: string;
+    }
+  | undefined
+> {
   let releaseRuntimeLease: (() => void) | undefined;
   try {
+    assertBoundedViewDescriptor(params);
     if (!params.runtime.readResource || !params.uiResourceUri.startsWith("ui://")) {
       return undefined;
     }
     const result = asRecord(
-      await params.runtime.readResource(params.serverName, params.uiResourceUri),
+      await params.runtime.readResource(params.serverName, params.uiResourceUri, {
+        failureBackoff: "ignore",
+      }),
     );
     const contents = Array.isArray(result?.contents) ? result.contents : [];
     if (contents.length !== 1) {
@@ -196,8 +265,9 @@ export async function fetchMcpAppView(params: {
     const csp = normalizeMcpAppCsp(uiMeta?.csp);
     const permissions = normalizePermissions(uiMeta?.permissions);
     const title = `${params.toolName} UI`;
-    const viewId = `mcp-app-${randomUUID()}`;
+    const viewId = params.viewId ?? `mcp-app-${randomUUID()}`;
     releaseRuntimeLease = params.runtime.acquireLease?.();
+    deleteView(viewId);
     pruneViewStore(byteSize, { reserveEntry: true });
     const view: McpAppViewLease = {
       viewId,
@@ -209,6 +279,10 @@ export async function fetchMcpAppView(params: {
       html,
       ...(csp ? { csp } : {}),
       ...(permissions ? { permissions } : {}),
+      ...(params.allowedAppToolNames
+        ? { allowedAppToolNames: new Set(params.allowedAppToolNames) }
+        : {}),
+      ...(params.readOnly ? { readOnly: true as const } : {}),
       toolInput: params.toolInput,
       toolResult: params.toolResult,
       expiresAtMs: Date.now() + MCP_APP_VIEW_TTL_MS,
@@ -225,7 +299,14 @@ export async function fetchMcpAppView(params: {
     }, MCP_APP_VIEW_TTL_MS);
     view.expiryTimer.unref?.();
     getViewStore().set(viewId, view);
-    return { viewId, title };
+    return {
+      viewId,
+      title,
+      serverName: params.serverName,
+      toolName: params.toolName,
+      uiResourceUri: params.uiResourceUri,
+      ...(params.toolCallId ? { toolCallId: params.toolCallId } : {}),
+    };
   } catch (error) {
     releaseRuntimeLease?.();
     logWarn(
@@ -274,7 +355,16 @@ export function acquireMcpAppViewRequest(
   };
 }
 
-export function buildMcpAppCanvasPayload(view: { viewId: string; title: string }) {
+export function buildMcpAppCanvasPayload(view: {
+  viewId: string;
+  title: string;
+  serverName: string;
+  toolName: string;
+  uiResourceUri: string;
+  toolCallId?: string;
+  resultMetaState?: "unavailable";
+}) {
+  assertBoundedViewDescriptor(view);
   return {
     kind: "canvas",
     view: { id: view.viewId, title: view.title },
@@ -284,7 +374,14 @@ export function buildMcpAppCanvasPayload(view: { viewId: string; title: string }
       preferred_height: 600,
       sandbox: "scripts",
     },
-    mcpApp: { viewId: view.viewId },
+    mcpApp: {
+      viewId: view.viewId,
+      serverName: view.serverName,
+      toolName: view.toolName,
+      uiResourceUri: view.uiResourceUri,
+      ...(view.toolCallId ? { toolCallId: view.toolCallId } : {}),
+      ...(view.resultMetaState ? { resultMetaState: view.resultMetaState } : {}),
+    },
   };
 }
 
@@ -296,4 +393,7 @@ const testing = {
   },
 };
 
-export { testing as __testing };
+if (process.env.VITEST || process.env.NODE_ENV === "test") {
+  (globalThis as Record<PropertyKey, unknown>)[Symbol.for("openclaw.mcpUiResourceTestApi")] =
+    testing;
+}

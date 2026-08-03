@@ -28,7 +28,7 @@ import {
 import { clearNodeWakeState } from "../server-methods/nodes-wake-state.js";
 import type { GatewayRequestContext, GatewayRequestHandlers } from "../server-methods/types.js";
 import { formatError } from "../server-utils.js";
-import { logWs } from "../ws-log.js";
+import { formatForLog, logWs } from "../ws-log.js";
 import { getHealthVersion, incrementPresenceVersion } from "./health-state.js";
 import type { PreauthConnectionBudget } from "./preauth-connection-budget.js";
 import { broadcastPresenceSnapshot } from "./presence-events.js";
@@ -147,7 +147,7 @@ function isWsPayloadLimitError(err: unknown): boolean {
   return typeof message === "string" && /max payload size exceeded/i.test(message);
 }
 
-export type GatewayWsSharedHandlerParams = {
+type GatewayWsSharedHandlerParams = {
   wss: WebSocketServer;
   clients: Set<GatewayWsClient>;
   preauthConnectionBudget: PreauthConnectionBudget;
@@ -540,6 +540,11 @@ export function attachGatewayWsConnectionHandler(params: AttachGatewayWsConnecti
       if (client && isWebchatClient(client.connect.client)) {
         logWsControl.info(
           `webchat disconnected code=${code} reason=${logReason || "n/a"} conn=${connId}`,
+        );
+      }
+      if (client?.authenticatedUserId) {
+        logWsControl.info(
+          `authenticated user disconnected code=${code} reason=${logReason || "n/a"} conn=${connId} user=${formatForLog(client.authenticatedUserId)}`,
         );
       }
       if (connectionKind === "gateway") {

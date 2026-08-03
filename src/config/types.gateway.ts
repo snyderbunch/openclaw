@@ -62,8 +62,6 @@ export type TalkRealtimeConfig = {
   speakerVoice?: string;
   /** Provider speaker voice id override for realtime sessions. */
   speakerVoiceId?: string;
-  /** @deprecated Use speakerVoice. */
-  voice?: string;
   /** Additional system instructions appended to realtime Talk sessions. */
   instructions?: string;
   /** Realtime execution mode. */
@@ -200,6 +198,20 @@ export type GatewayTrustedProxyConfig = {
    * trust boundary and direct Gateway access is otherwise locked down.
    */
   allowLoopback?: boolean;
+  /**
+   * Automatically approve new browser device identities after trusted-proxy
+   * authentication. Disabled by default; existing-device upgrades stay manual.
+   */
+  deviceAutoApprove?: {
+    /** Enable automatic approval for new browser devices. @default false */
+    enabled?: boolean;
+    /**
+     * Maximum operator scopes granted by automatic approval. operator.admin
+     * is intentionally forbidden. @default operator.read, operator.write,
+     * operator.approvals
+     */
+    scopes?: string[];
+  };
 };
 
 export type GatewayAuthConfig = {
@@ -251,8 +263,6 @@ export type GatewayTailscaleConfig = {
 };
 
 export type GatewayRemoteConfig = {
-  /** Whether remote gateway surfaces are enabled. Default: true when absent. */
-  enabled?: boolean;
   /** Remote Gateway WebSocket URL (ws:// or wss://). */
   url?: string;
   /** Transport for macOS remote connections (ssh tunnel or direct WS). */

@@ -1,4 +1,6 @@
 /** Tests BTW side-question execution, session context, auth, and harness routing. */
+
+import { expectDefined } from "@openclaw/normalization-core";
 import { MAX_TIMER_TIMEOUT_MS } from "@openclaw/normalization-core/number-coercion";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { SessionEntry } from "../config/sessions.js";
@@ -18,6 +20,7 @@ const buildSessionContextMock = vi.fn();
 const ensureOpenClawModelsJsonMock = vi.fn();
 const discoverAuthStorageMock = vi.fn();
 const discoverModelsMock = vi.fn();
+const getModelRegistryRuntimeMock = vi.fn();
 const resolveModelWithRegistryMock = vi.fn();
 const ensureAuthProfileStoreMock = vi.fn();
 const ensureAuthProfileStoreWithoutExternalProfilesMock = vi.fn();
@@ -78,6 +81,10 @@ vi.mock("./models-config.js", () => ({
 vi.mock("./agent-model-discovery.js", () => ({
   discoverAuthStorage: (...args: unknown[]) => discoverAuthStorageMock(...args),
   discoverModels: (...args: unknown[]) => discoverModelsMock(...args),
+}));
+
+vi.mock("./sessions/model-registry-runtime.js", () => ({
+  getModelRegistryRuntime: (...args: unknown[]) => getModelRegistryRuntimeMock(...args),
 }));
 
 vi.mock("./embedded-agent-runner/model.js", () => ({
@@ -530,6 +537,11 @@ describe("runBtwSideQuestion", () => {
     ensureOpenClawModelsJsonMock.mockReset();
     discoverAuthStorageMock.mockReset();
     discoverModelsMock.mockReset();
+    getModelRegistryRuntimeMock.mockReset();
+    getModelRegistryRuntimeMock.mockReturnValue({
+      apiRegistry: {},
+      llmRuntime: { streamSimple: streamSimpleMock },
+    });
     resolveModelAsyncMock.mockReset();
     resolveModelWithRegistryMock.mockReset();
     ensureAuthProfileStoreMock.mockReset();
@@ -2245,7 +2257,10 @@ describe("runBtwSideQuestion", () => {
     const [message] = contextMessages(streamContext());
     expectRecordFields(message, { role: "user" });
     expectTextBlockContains(
-      (message.content as Array<unknown>)[0],
+      expectDefined(
+        (expectDefined(message, "message test invariant").content as Array<unknown>)[0],
+        "(message.content as Array<unknown>)[0] test invariant",
+      ),
       "<in_flight_main_task>\nbuild me a tic-tac-toe game in brainfuck\n</in_flight_main_task>",
     );
   });
@@ -2686,3 +2701,4 @@ describe("runBtwSideQuestion", () => {
     expectNoAssistantMessages(context);
   });
 });
+/* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */

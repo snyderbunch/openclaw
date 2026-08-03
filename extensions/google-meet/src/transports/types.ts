@@ -1,7 +1,15 @@
 // Google Meet type declarations define plugin contracts.
+import type {
+  MeetingBrowserHealth,
+  MeetingBrowserTab,
+  MeetingSessionRecord,
+  MeetingTranscriptSnapshot,
+} from "openclaw/plugin-sdk/meeting-runtime";
 import type { GoogleMeetMode, GoogleMeetModeInput, GoogleMeetTransport } from "../config.js";
 
-type GoogleMeetSessionState = "active" | "ended";
+export const GOOGLE_MEET_TRANSCRIPT_MAX_LINES = 2_000;
+
+export type GoogleMeetTranscriptSnapshot = MeetingTranscriptSnapshot;
 
 export type GoogleMeetJoinRequest = {
   url: string;
@@ -33,7 +41,10 @@ type GoogleMeetSpeechBlockedReason =
   | "audio-bridge-unavailable"
   | "meet-microphone-muted";
 
-export type GoogleMeetChromeHealth = {
+export type GoogleMeetChromeHealth = MeetingBrowserHealth<
+  GoogleMeetManualActionReason,
+  GoogleMeetSpeechBlockedReason
+> & {
   inCall?: boolean;
   micMuted?: boolean;
   lobbyWaiting?: boolean;
@@ -107,32 +118,21 @@ export type GoogleMeetChromeHealth = {
   notes?: string[];
 };
 
-export type GoogleMeetBrowserTab = {
-  targetId: string;
-  openedByPlugin: boolean;
-};
+export type GoogleMeetBrowserTab = MeetingBrowserTab;
 
-export type GoogleMeetSession = {
-  id: string;
-  url: string;
-  transport: GoogleMeetTransport;
-  mode: GoogleMeetMode;
-  /** Canonical agent owner for every later consult and bridge restart. */
-  agentId: string;
-  state: GoogleMeetSessionState;
-  /** Terminal browser-departure result, retained so repeated leave calls stay idempotent. */
-  browserLeft?: boolean;
-  createdAt: string;
-  updatedAt: string;
-  participantIdentity: string;
-  realtime: {
+export type GoogleMeetSession = MeetingSessionRecord<
+  GoogleMeetTransport,
+  GoogleMeetMode,
+  {
     enabled: boolean;
     strategy?: string;
     provider?: string;
     model?: string;
     transcriptionProvider?: string;
     toolPolicy: string;
-  };
+  }
+> & {
+  /** Canonical agent owner and shared fields retain their byte-compatible wire names. */
   chrome?: {
     audioBackend: "blackhole-2ch";
     launched: boolean;
@@ -154,7 +154,6 @@ export type GoogleMeetSession = {
     dtmfSent?: boolean;
     introSent?: boolean;
   };
-  notes: string[];
 };
 
 export type GoogleMeetJoinResult = {

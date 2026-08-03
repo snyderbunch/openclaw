@@ -28,6 +28,7 @@ import {
   createSessionEntryWithTranscript,
   resolveSessionEntryAccessTarget,
 } from "../config/sessions/session-accessor.js";
+import { inheritSessionSelection } from "../config/sessions/session-entry-selection.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import {
   createInternalHookEvent,
@@ -51,9 +52,16 @@ import {
   runExclusiveSessionLifecycleMutation,
 } from "../sessions/session-lifecycle-admission.js";
 import { createLazyRuntimeModule } from "../shared/lazy-runtime.js";
+import { buildForkedGatewaySessionEntry } from "./session-create-fork-entry.js";
 import { resolveSessionStoreAgentId, resolveSessionStoreKey } from "./session-store-key.js";
 import { loadSessionEntry, resolveGatewaySessionStoreTarget } from "./session-utils.js";
 import { applySessionsPatchToStore } from "./sessions-patch.js";
+
+type TrustedCatalogSessionTarget = {
+  model: string;
+  agentRuntime: string;
+  pluginOwnerId: string;
+};
 
 const loadSessionLifecycleRuntime = createLazyRuntimeModule(
   () => import("./server-methods/sessions.runtime.js"),
@@ -118,34 +126,6 @@ export function buildDashboardSessionKey(agentId: string): string {
   return `agent:${agentId}:dashboard:${randomUUID()}`;
 }
 
-function inheritSessionSelection(parentEntry: SessionEntry | undefined): Partial<SessionEntry> {
-  if (!parentEntry) {
-    return {};
-  }
-  return {
-    ...(parentEntry.providerOverride ? { providerOverride: parentEntry.providerOverride } : {}),
-    ...(parentEntry.modelOverride ? { modelOverride: parentEntry.modelOverride } : {}),
-    ...(parentEntry.modelOverrideSource
-      ? { modelOverrideSource: parentEntry.modelOverrideSource }
-      : {}),
-    ...(parentEntry.agentRuntimeOverride
-      ? { agentRuntimeOverride: parentEntry.agentRuntimeOverride }
-      : {}),
-    ...(parentEntry.thinkingLevel ? { thinkingLevel: parentEntry.thinkingLevel } : {}),
-    ...(parentEntry.fastMode !== undefined ? { fastMode: parentEntry.fastMode } : {}),
-    ...(parentEntry.verboseLevel ? { verboseLevel: parentEntry.verboseLevel } : {}),
-    ...(parentEntry.traceLevel ? { traceLevel: parentEntry.traceLevel } : {}),
-    ...(parentEntry.reasoningLevel ? { reasoningLevel: parentEntry.reasoningLevel } : {}),
-    ...(parentEntry.elevatedLevel ? { elevatedLevel: parentEntry.elevatedLevel } : {}),
-    ...(parentEntry.authProfileOverride
-      ? { authProfileOverride: parentEntry.authProfileOverride }
-      : {}),
-    ...(parentEntry.authProfileOverrideSource
-      ? { authProfileOverrideSource: parentEntry.authProfileOverrideSource }
-      : {}),
-  };
-}
-
 type CreatedGatewaySession = {
   key: string;
   agentId: string;
@@ -181,14 +161,26 @@ export async function createGatewaySession(params: {
   agentId?: string;
   label?: string;
   model?: string;
+  thinkingLevel?: string;
+  /** Trusted catalog-owned model/runtime pair, persisted and locked together. */
+  catalogTarget?: TrustedCatalogSessionTarget;
   parentSessionKey?: string;
   spawnedCwd?: string;
   /** Managed worktree bound to the new session; persisted alongside spawnedCwd. */
   worktree?: { id: string; branch: string; repoRoot: string };
   /** Bind session exec to host=node with this node id; caller scope-checks. */
   execNode?: string;
+  /** Working directory interpreted only by execNode. */
+  execCwd?: string;
+  /** Clear a prior node binding when a new Gateway-host session replaces it. */
+  clearExecBinding?: boolean;
   clearSpawnedCwd?: boolean;
   fork?: boolean;
+  /**
+   * Controls whether a distinct child terminates its parent. Omission preserves
+   * the legacy rollover; callers use `false` for a parallel child.
+   */
+  succeedsParent?: boolean;
   emitCommandHooks?: boolean;
   resetMainWhenUnspecified?: boolean;
   commandSource: string;
@@ -202,9 +194,42 @@ export async function createGatewaySession(params: {
   afterCreate?: (created: CreatedGatewaySession) => Promise<void>;
 }): Promise<CreateGatewaySessionResult> {
   const requestedKey = normalizeOptionalString(params.key);
+  const parentSessionKey = normalizeOptionalString(params.parentSessionKey);
   const agentId = normalizeAgentId(
     normalizeOptionalString(params.agentId) ?? resolveDefaultAgentId(params.cfg),
   );
+  const catalogModel = normalizeOptionalString(params.catalogTarget?.model);
+  const catalogAgentRuntime = normalizeOptionalAgentRuntimeId(params.catalogTarget?.agentRuntime);
+  const catalogPluginOwnerId = normalizeOptionalString(params.catalogTarget?.pluginOwnerId);
+  if (params.catalogTarget && (!catalogModel || !catalogAgentRuntime || !catalogPluginOwnerId)) {
+    return {
+      ok: false,
+      error: errorShape(ErrorCodes.INVALID_REQUEST, "invalid catalog session target"),
+    };
+  }
+  if (params.succeedsParent !== undefined) {
+    if (!parentSessionKey) {
+      return {
+        ok: false,
+        error: errorShape(ErrorCodes.INVALID_REQUEST, "succeedsParent requires parentSessionKey"),
+      };
+    }
+    if (params.emitCommandHooks !== true) {
+      return {
+        ok: false,
+        error: errorShape(ErrorCodes.INVALID_REQUEST, "succeedsParent requires emitCommandHooks"),
+      };
+    }
+    if (params.succeedsParent && params.fork === true) {
+      return {
+        ok: false,
+        error: errorShape(
+          ErrorCodes.INVALID_REQUEST,
+          "succeedsParent conflicts with fork: a fork runs in parallel to its parent",
+        ),
+      };
+    }
+  }
   if (requestedKey) {
     const requestedAgentId = parseAgentSessionKey(requestedKey)?.agentId;
     if (
@@ -231,6 +256,19 @@ export async function createGatewaySession(params: {
           mainKey: params.cfg.session?.mainKey,
         })
     : undefined;
+  if (
+    params.catalogTarget &&
+    explicitTargetKey &&
+    !explicitTargetKey.startsWith(`agent:${agentId}:dashboard:`)
+  ) {
+    return {
+      ok: false,
+      error: errorShape(
+        ErrorCodes.INVALID_REQUEST,
+        "catalog sessions require a generated dashboard key",
+      ),
+    };
+  }
 
   const authorizedHarnessCreation = Boolean(
     explicitTargetKey &&
@@ -269,13 +307,24 @@ export async function createGatewaySession(params: {
     };
   }
 
-  const parentSessionKey = normalizeOptionalString(params.parentSessionKey);
   if (params.fork === true && !parentSessionKey) {
     return {
       ok: false,
       error: errorShape(ErrorCodes.INVALID_REQUEST, "fork requires parentSessionKey"),
     };
   }
+  const targetSessionKey = explicitTargetKey ?? buildDashboardSessionKey(agentId);
+  const agentMainSessionKey = resolveAgentMainSessionKey({ cfg: params.cfg, agentId });
+  // Dashboard sessions parent to main for flow-up notices and sidebar threads.
+  // Isolated DM scopes lack the shared watcher; global scope lacks a per-agent main.
+  const dashboardParentSessionKey =
+    !parentSessionKey &&
+    params.fork !== true &&
+    (params.cfg.session?.dmScope ?? "main") === "main" &&
+    params.cfg.session?.scope !== "global" &&
+    targetSessionKey !== agentMainSessionKey
+      ? agentMainSessionKey
+      : undefined;
   let canonicalParentSessionKey: string | undefined;
   let parentSessionEntry: SessionEntry | undefined;
   let parentSelectedAgentId: string | undefined;
@@ -346,6 +395,9 @@ export async function createGatewaySession(params: {
     params.emitCommandHooks === true &&
     !requestedKey &&
     params.resetMainWhenUnspecified === true &&
+    // Catalog targets need a fresh locked row; resetting main would return before
+    // the catalog-owned model/runtime pair is persisted.
+    !params.catalogTarget &&
     params.cfg.session?.dmScope === "main"
   ) {
     const parentAgentId = normalizeAgentId(
@@ -357,6 +409,7 @@ export async function createGatewaySession(params: {
     if (canonicalParentSessionKey === parentMainKey) {
       const { performGatewaySessionReset } = await loadSessionLifecycleRuntime();
       const spawnedCwd = normalizeOptionalString(params.spawnedCwd);
+      const execCwd = normalizeOptionalString(params.execCwd);
       const resetResult = await performGatewaySessionReset({
         key: canonicalParentSessionKey,
         ...(canonicalParentSessionKey === "global" && parentSelectedAgentId
@@ -367,6 +420,8 @@ export async function createGatewaySession(params: {
         ...(spawnedCwd ? { spawnedCwd } : {}),
         ...(params.worktree ? { worktree: params.worktree } : {}),
         ...(params.execNode ? { execNode: params.execNode } : {}),
+        ...(execCwd ? { execCwd } : {}),
+        ...(params.clearExecBinding ? { clearExecBinding: true } : {}),
         ...(params.clearSpawnedCwd && !spawnedCwd ? { clearSpawnedCwd: true } : {}),
       });
       if (!resetResult.ok) {
@@ -462,7 +517,7 @@ export async function createGatewaySession(params: {
       });
     }
 
-    const key = explicitTargetKey ?? buildDashboardSessionKey(agentId);
+    const key = targetSessionKey;
     const target = resolveGatewaySessionStoreTarget({ cfg: params.cfg, key, agentId });
     const created = await createSessionEntryWithTranscript<ErrorShape>(
       {
@@ -502,6 +557,15 @@ export async function createGatewaySession(params: {
             ),
           };
         }
+        if (params.catalogTarget && existingEntry !== undefined) {
+          return {
+            ok: false,
+            error: errorShape(
+              ErrorCodes.INVALID_REQUEST,
+              "catalog session target requires a new session",
+            ),
+          };
+        }
         const patched = await applySessionsPatchToStore({
           cfg: params.cfg,
           store: sessionEntries,
@@ -510,7 +574,8 @@ export async function createGatewaySession(params: {
           patch: {
             key: target.canonicalKey,
             label: normalizeOptionalString(params.label),
-            model: normalizeOptionalString(params.model),
+            model: catalogModel ?? normalizeOptionalString(params.model),
+            thinkingLevel: normalizeOptionalString(params.thinkingLevel),
           },
           loadGatewayModelCatalog: params.loadGatewayModelCatalog,
           authorizedAgentHarnessId: params.authorizedAgentHarnessId,
@@ -520,6 +585,7 @@ export async function createGatewaySession(params: {
         }
         const spawnedCwd = normalizeOptionalString(params.spawnedCwd);
         const execNode = normalizeOptionalString(params.execNode);
+        const execCwd = normalizeOptionalString(params.execCwd);
         const initialAgentHarnessId = params.initialEntry
           ? normalizeOptionalString(params.initialEntry.agentHarnessId)
           : undefined;
@@ -546,13 +612,26 @@ export async function createGatewaySession(params: {
             ),
           };
         }
+        const catalogResolvedModel = params.catalogTarget
+          ? resolveSessionModelRef(params.cfg, patched.entry, target.agentId)
+          : undefined;
         const initializedEntry: SessionEntry = {
           ...patched.entry,
+          ...(catalogResolvedModel && catalogAgentRuntime
+            ? {
+                providerOverride: catalogResolvedModel.provider,
+                modelOverride: catalogResolvedModel.model,
+                modelOverrideSource: "user" as const,
+                agentRuntimeOverride: catalogAgentRuntime,
+                modelSelectionLocked: true,
+                pluginOwnerId: catalogPluginOwnerId,
+              }
+            : {}),
           // Session worktrees adopt cwd only during admin-gated creation; public patching stays
           // restricted to spawned subagent and ACP lineage.
           ...(spawnedCwd ? { spawnedCwd } : {}),
           ...(params.worktree ? { worktree: params.worktree } : {}),
-          ...(execNode ? { execHost: "node", execNode } : {}),
+          ...(execNode ? { execHost: "node", execNode, ...(execCwd ? { execCwd } : {}) } : {}),
           ...(initialAgentHarnessId ? { agentHarnessId: initialAgentHarnessId } : {}),
           ...(authorizedPluginCreation
             ? { pluginOwnerId: params.initialEntry?.pluginOwnerId }
@@ -580,21 +659,27 @@ export async function createGatewaySession(params: {
         };
         sessionEntries[target.canonicalKey] = initializedEntry;
         const initialized = { ...patched, entry: initializedEntry };
-        if (!canonicalParentSessionKey) {
+        const storedParentSessionKey =
+          canonicalParentSessionKey ??
+          normalizeOptionalString(initializedEntry.parentSessionKey) ??
+          dashboardParentSessionKey;
+        if (!storedParentSessionKey) {
           return initialized;
         }
-        const inheritedSelection = normalizeOptionalString(params.model)
-          ? {}
-          : inheritSessionSelection(currentParentSessionEntry);
+        const inheritedSelection =
+          !canonicalParentSessionKey || catalogModel || normalizeOptionalString(params.model)
+            ? {}
+            : inheritSessionSelection(currentParentSessionEntry);
         const entry: SessionEntry = {
           ...initializedEntry,
           ...inheritedSelection,
-          parentSessionKey: canonicalParentSessionKey,
+          parentSessionKey: storedParentSessionKey,
         };
         if (params.fork !== true) {
           return { ...initialized, entry };
         }
-        if (!currentParentSessionEntry || !parentSessionTarget) {
+        const forkParentSessionKey = canonicalParentSessionKey;
+        if (!forkParentSessionKey || !currentParentSessionEntry || !parentSessionTarget) {
           return {
             ok: false,
             error: errorShape(ErrorCodes.UNAVAILABLE, "failed to resolve parent session for fork"),
@@ -620,7 +705,7 @@ export async function createGatewaySession(params: {
         const fork = await forkSessionFromParent({
           parentEntry: currentParentSessionEntry,
           agentId: parentSessionTarget.agentId,
-          parentSessionKey: canonicalParentSessionKey,
+          parentSessionKey: forkParentSessionKey,
           sessionKey: target.canonicalKey,
           storePath: parentSessionTarget.storePath,
           // Keep the fork transcript owned by the child store across agent boundaries.
@@ -634,14 +719,7 @@ export async function createGatewaySession(params: {
         }
         return {
           ...initialized,
-          entry: {
-            ...entry,
-            sessionId: fork.sessionId,
-            sessionFile: fork.sessionFile,
-            forkedFromParent: true,
-            totalTokens: undefined,
-            totalTokensFresh: false,
-          },
+          entry: buildForkedGatewaySessionEntry(entry, fork),
         };
       },
       params.initialEntry
@@ -675,17 +753,21 @@ export async function createGatewaySession(params: {
       const parentEntry = currentParentSessionEntry;
       const { emitGatewaySessionEndPluginHook, emitGatewaySessionStartPluginHook } =
         await loadSessionLifecycleRuntime();
-      emitGatewaySessionEndPluginHook({
-        cfg: params.cfg,
-        sessionKey: canonicalParentSessionKey,
-        sessionId: parentEntry?.sessionId,
-        storePath: parentSessionTarget.storePath,
-        sessionFile: parentEntry?.sessionFile,
-        agentId: parentSessionTarget.agentId,
-        reason: "new",
-        nextSessionId: created.entry.sessionId,
-        nextSessionKey: target.canonicalKey,
-      });
+      // Child key shape does not establish lifecycle ownership. The caller owns
+      // that fact; omission keeps the shipped rollover for out-of-tree clients.
+      if (params.succeedsParent !== false) {
+        emitGatewaySessionEndPluginHook({
+          cfg: params.cfg,
+          sessionKey: canonicalParentSessionKey,
+          sessionId: parentEntry?.sessionId,
+          storePath: parentSessionTarget.storePath,
+          sessionFile: parentEntry?.sessionFile,
+          agentId: parentSessionTarget.agentId,
+          reason: "new",
+          nextSessionId: created.entry.sessionId,
+          nextSessionKey: target.canonicalKey,
+        });
+      }
       emitGatewaySessionStartPluginHook({
         cfg: params.cfg,
         sessionKey: target.canonicalKey,
@@ -734,3 +816,4 @@ export async function createGatewaySession(params: {
   }
   return result;
 }
+/* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */
