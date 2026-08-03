@@ -28,4 +28,36 @@ describe("SnapshotSchema", () => {
   it("keeps presence user identity optional", () => {
     expect(Value.Check(SnapshotSchema, snapshotWithPresence({ ts: 1 }))).toBe(true);
   });
+
+  it("accepts optional watched session keys", () => {
+    expect(
+      Value.Check(
+        SnapshotSchema,
+        snapshotWithPresence({
+          ts: 1,
+          watchedSessions: ["agent:main:main", "agent:main:work"],
+        }),
+      ),
+    ).toBe(true);
+  });
+
+  it("accepts persistent event-loop health duration", () => {
+    const snapshot = {
+      ...snapshotWithPresence({ ts: 1 }),
+      health: {
+        eventLoop: {
+          degraded: true,
+          degradedSinceMs: 61_000,
+          reasons: ["event_loop_delay"],
+          intervalMs: 30_000,
+          delayP99Ms: 1_200,
+          delayMaxMs: 1_500,
+          utilization: 0.75,
+          cpuCoreRatio: 0.5,
+        },
+      },
+    };
+
+    expect(Value.Check(SnapshotSchema, snapshot)).toBe(true);
+  });
 });
