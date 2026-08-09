@@ -29,6 +29,7 @@ import "../../styles/chat.css";
 import "../../styles/new-session.css";
 import { buildChatApiAttachments, restoreChatApiAttachments } from "../chat/attachment-api.ts";
 import { requiresChatModelSetup } from "../chat/chat-model-setup.ts";
+import { clearChatModelSearchOnEscape } from "../chat/components/chat-model-picker.ts";
 import { renderWelcomeState } from "../chat/components/chat-welcome.ts";
 import { prepareInitialUserMessageHandoff } from "../chat/initial-turn-handoff.ts";
 import { NewSessionAttachmentDraft } from "./attachment-draft.ts";
@@ -60,7 +61,7 @@ import {
 } from "./discovery.ts";
 import { isMissingRestoredFolderError } from "./folder-validation.ts";
 import { discoverGatewayName } from "./gateway-name-discovery.ts";
-import type { NewSessionRouteData } from "./location.ts";
+import { newSessionSearch, type NewSessionRouteData } from "./location.ts";
 import { NewSessionModelControl } from "./model-control.ts";
 import { isAbsolutePath } from "./path.ts";
 import { renderPlaceSelect } from "./place-picker.ts";
@@ -129,6 +130,10 @@ class NewSessionPage extends OpenClawLightDomElement {
   private readonly modelControl = new NewSessionModelControl(
     () => this.requestUpdate(),
     (selection) => this.persistPreference(selection),
+    (catalogId) =>
+      this.context?.navigate("new-session", {
+        search: newSessionSearch(this.agentId, { catalogId }),
+      }),
   );
   private gatewaySource: ApplicationContext["gateway"] | null = null;
   private gatewayClient: ApplicationContext["gateway"]["snapshot"]["client"] = null;
@@ -158,6 +163,10 @@ class NewSessionPage extends OpenClawLightDomElement {
     .watch(
       () => this.context?.sessions,
       (sessions, notify) => sessions.subscribe(notify),
+    )
+    .watch(
+      () => this.context?.config,
+      (config, notify) => config.subscribe(() => notify()),
     );
 
   private readonly gatewayNameTask = new Task(this, {
@@ -390,13 +399,21 @@ class NewSessionPage extends OpenClawLightDomElement {
   }
 
   handleEvent(event: Event) {
-    const picker = this.querySelector<HTMLDetailsElement>(".chat-controls__model[open]");
-    if (!picker) {
+    const pickers = this.querySelectorAll<HTMLDetailsElement>(
+      ".chat-controls__inline-select[open]",
+    );
+    if (pickers.length === 0) {
       return;
     }
     if (event.type === "keydown") {
       const keyEvent = event as KeyboardEvent;
+      clearChatModelSearchOnEscape(keyEvent);
       if (keyEvent.defaultPrevented || keyEvent.key !== "Escape") {
+        return;
+      }
+      const picker =
+        [...pickers].find((candidate) => event.composedPath().includes(candidate)) ?? pickers[0];
+      if (!picker) {
         return;
       }
       const restoreFocus = event.composedPath().includes(picker);
@@ -408,15 +425,17 @@ class NewSessionPage extends OpenClawLightDomElement {
       }
       return;
     }
-    if (!event.composedPath().includes(picker)) {
-      picker.open = false;
-    }
+    pickers.forEach((picker) => {
+      if (!event.composedPath().includes(picker)) {
+        picker.open = false;
+      }
+    });
   }
 
   override connectedCallback() {
     super.connectedCallback();
-    // /new renders chat controls without ChatPane, so the route owns both
-    // pointer and Escape light-dismissal for the combined picker.
+    // /new renders chat controls without ChatPane, so the route owns pointer
+    // and Escape light-dismissal for both picker popovers.
     document.addEventListener("keydown", this, true);
     document.addEventListener("pointerdown", this, true);
   }
@@ -446,6 +465,11 @@ class NewSessionPage extends OpenClawLightDomElement {
 
   override updated() {
     this.retryPendingCatalogTarget();
+    this.modelControl.loadCatalogTargets(
+      this.context,
+      this.agentId,
+      this.context?.config.current.cliAgentsEnabled === true && !catalog.isTarget(this.data),
+    );
     const agentState = this.context?.agents.state;
     const agentsReady = Boolean(
       this.gatewayConnected &&

@@ -28,7 +28,6 @@ import {
   areUiSessionKeysEquivalent,
   resolveAgentIdFromSessionKey,
 } from "../../lib/sessions/session-key.ts";
-import { ensureBoardViewElement, ensureWorkboardCardChipElement } from "./board-session-surface.ts";
 import { invalidateChatAvatarCache, refreshChatAvatar } from "./chat-avatar.ts";
 import { clearChatHistory } from "./chat-history.ts";
 import { ChatPaneBoard } from "./chat-pane-board.ts";
@@ -43,6 +42,7 @@ import {
   NEW_SESSION_CREATE_FAILED_MESSAGE,
   NEW_SESSION_LIST_LOADING_MESSAGE,
 } from "./chat-pane-shared.ts";
+import { setChatError } from "./chat-send-queue-state.ts";
 import { applySelectedChatAgent } from "./chat-session.ts";
 import { handlePageGatewayEvent } from "./chat-state-events.ts";
 import { createPageState } from "./chat-state-page.ts";
@@ -51,6 +51,7 @@ import { selectedChatSessionRow, canCreateChatSession } from "./chat-state-route
 import { resetChatViewState } from "./chat-view-state.ts";
 import { chatAttachmentFromDataUrl } from "./components/chat-attachments.ts";
 import { dismissConfirmedActionPopovers } from "./components/chat-message.ts";
+import { clearChatModelSearchOnEscape } from "./components/chat-model-picker.ts";
 import { toggleSessionWorkspace } from "./components/chat-session-workspace.ts";
 import { WIDGET_PROMPT_EVENT, type WidgetPromptEventDetail } from "./components/chat-tool-cards.ts";
 import { CHAT_COMPOSER_DRAFT_STORAGE_ERROR } from "./composer-persistence.ts";
@@ -209,14 +210,12 @@ export abstract class ChatPaneLifecycle extends ChatPaneBoard {
       context.gateway.snapshot.phase === "connected" &&
       this.connectionGeneration === connectionGeneration;
     if (!canCreateChatSession(state)) {
-      state.lastError = NEW_SESSION_ACTIVE_RUN_MESSAGE;
-      state.chatError = state.lastError;
+      setChatError(state, NEW_SESSION_ACTIVE_RUN_MESSAGE);
       state.requestUpdate?.();
       return false;
     }
     if (state.sessionsLoading) {
-      state.lastError = NEW_SESSION_LIST_LOADING_MESSAGE;
-      state.chatError = state.lastError;
+      setChatError(state, NEW_SESSION_LIST_LOADING_MESSAGE);
       state.requestUpdate?.();
       return false;
     }
@@ -233,8 +232,7 @@ export abstract class ChatPaneLifecycle extends ChatPaneBoard {
       return false;
     }
     if (!canCreateChatSession(state)) {
-      state.lastError = NEW_SESSION_ACTIVE_RUN_MESSAGE;
-      state.chatError = state.lastError;
+      setChatError(state, NEW_SESSION_ACTIVE_RUN_MESSAGE);
       state.requestUpdate?.();
       return false;
     }
@@ -244,8 +242,7 @@ export abstract class ChatPaneLifecycle extends ChatPaneBoard {
       return false;
     }
 
-    state.lastError = null;
-    state.chatError = null;
+    setChatError(state, null);
     if (preservesBoard) {
       // Captured before the await: the reset can land and refresh session rows
       // mid-flight, and invalidating the post-reset id would eat fresh digests.
@@ -276,12 +273,13 @@ export abstract class ChatPaneLifecycle extends ChatPaneBoard {
       !canCreateChatSession(state)
     ) {
       if (!nextSessionKey) {
-        state.lastError =
+        setChatError(
+          state,
           state.sessionsError ??
-          (state.sessionsLoading
-            ? NEW_SESSION_LIST_LOADING_MESSAGE
-            : NEW_SESSION_CREATE_FAILED_MESSAGE);
-        state.chatError = state.lastError;
+            (state.sessionsLoading
+              ? NEW_SESSION_LIST_LOADING_MESSAGE
+              : NEW_SESSION_CREATE_FAILED_MESSAGE),
+        );
         state.requestUpdate?.();
       }
       return false;
@@ -348,7 +346,10 @@ export abstract class ChatPaneLifecycle extends ChatPaneBoard {
     if (!this.active || !state || !state.connected || state.sessionKey !== expectedSessionKey) {
       return;
     }
-    const revision = this.context.skillWorkshopRevision.consume(expectedSessionKey);
+    const revision = this.context.skillWorkshopRevision.consume(
+      expectedSessionKey,
+      this.context.gateway.snapshot.hello,
+    );
     if (!revision) {
       return;
     }
@@ -361,8 +362,7 @@ export abstract class ChatPaneLifecycle extends ChatPaneBoard {
         },
       })
       .catch((error: unknown) => {
-        state.lastError = error instanceof Error ? error.message : String(error);
-        state.chatError = state.lastError;
+        setChatError(state, error instanceof Error ? error.message : String(error));
         state.requestUpdate?.();
       });
   }
@@ -406,6 +406,7 @@ export abstract class ChatPaneLifecycle extends ChatPaneBoard {
       }
     }
 
+    clearChatModelSearchOnEscape(event);
     if (event.defaultPrevented || event.key !== "Escape") {
       return;
     }
@@ -680,20 +681,7 @@ export abstract class ChatPaneLifecycle extends ChatPaneBoard {
     this.cancelResetConfirmationForSessionChange();
     this.syncHistoryObserver();
     const board = this.resolveBoardView();
-    if (this.resolveWorkboardCardChip(board)) {
-      void ensureWorkboardCardChipElement().catch(() => undefined);
-    }
-    if (
-      board.hasBoard &&
-      board.face === "dashboard" &&
-      !customElements.get("openclaw-board-view")
-    ) {
-      void ensureBoardViewElement().then((loaded) => {
-        if (loaded) {
-          this.requestUpdate();
-        }
-      });
-    }
+    this.syncRetainedBoardSession(board);
     const selectedSessionRow = this.state ? selectedChatSessionRow(this.state) : undefined;
     // Active runs count even without a digest: a hidden observer generates
     // none, and the rail module owns the restore control for turning it back on.
@@ -709,6 +697,7 @@ export abstract class ChatPaneLifecycle extends ChatPaneBoard {
 
   override disconnectedCallback() {
     this.clearComposerPrefillAttention();
+    this.retainedBoardSessionKey = "";
     this.boardProviderLifecycleConnected = false;
     this.releaseBoardProviderLease();
     this.settleResetConfirmation(false);

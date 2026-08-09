@@ -1,3 +1,5 @@
+import { resolveSessionAuthProfileOverrideSource } from "./auth-profile-override-provenance.js";
+import type { SessionPatchProjectionSnapshot } from "./session-accessor.types.js";
 import type { SessionEntry } from "./types.js";
 
 type SessionProjectionTarget = {
@@ -12,6 +14,7 @@ export function inheritSessionSelection(
   if (!parentEntry) {
     return {};
   }
+  const authProfileOverrideSource = resolveSessionAuthProfileOverrideSource(parentEntry);
   return {
     ...(parentEntry.providerOverride ? { providerOverride: parentEntry.providerOverride } : {}),
     ...(parentEntry.modelOverride ? { modelOverride: parentEntry.modelOverride } : {}),
@@ -31,12 +34,10 @@ export function inheritSessionSelection(
     ...(parentEntry.traceLevel ? { traceLevel: parentEntry.traceLevel } : {}),
     ...(parentEntry.reasoningLevel ? { reasoningLevel: parentEntry.reasoningLevel } : {}),
     ...(parentEntry.elevatedLevel ? { elevatedLevel: parentEntry.elevatedLevel } : {}),
-    ...(parentEntry.authProfileOverride
+    ...(authProfileOverrideSource && parentEntry.authProfileOverride
       ? { authProfileOverride: parentEntry.authProfileOverride }
       : {}),
-    ...(parentEntry.authProfileOverrideSource
-      ? { authProfileOverrideSource: parentEntry.authProfileOverrideSource }
-      : {}),
+    ...(authProfileOverrideSource ? { authProfileOverrideSource } : {}),
   };
 }
 
@@ -45,13 +46,13 @@ function cloneOptionalSessionEntry(entry: SessionEntry | undefined): SessionEntr
 }
 
 export function resolveProjectionExistingEntry(
-  entries: readonly { sessionKey: string; entry: SessionEntry }[],
+  snapshot: SessionPatchProjectionSnapshot,
   target: SessionProjectionTarget,
 ): SessionEntry | undefined {
   const candidateKeys = target.candidateKeys ?? [target.primaryKey];
   let freshest: SessionEntry | undefined;
   for (const candidateKey of candidateKeys) {
-    const entry = entries.find((candidate) => candidate.sessionKey === candidateKey)?.entry;
+    const entry = snapshot.store[candidateKey];
     if (entry && (!freshest || (entry.updatedAt ?? 0) > (freshest.updatedAt ?? 0))) {
       freshest = entry;
     }

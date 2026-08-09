@@ -1,3 +1,4 @@
+import { stripOpenAIResponsesCompactionReplayCheckpoint } from "@openclaw/ai/transports";
 import type { AgentMessage } from "../../types.js";
 import {
   asAgentMessage,
@@ -10,12 +11,13 @@ import type { CompactionEntry, ResetEntry, SessionContext, SessionTreeEntry } fr
 type ContextBoundary = CompactionEntry | ResetEntry;
 const SESSION_HISTORY_PRELUDE = Symbol.for("openclaw.sessionHistoryPrelude");
 
-function appendContextMessage(messages: AgentMessage[], entry: SessionTreeEntry): void {
-  if (entry.type === "message") {
-    messages.push(entry.message);
-  } else if (entry.type === "custom_message") {
-    messages.push(
-      asAgentMessage(
+/** Project persisted session entries into the message shared by replay and summarization. */
+export function projectSessionEntryMessage(entry: SessionTreeEntry): AgentMessage | undefined {
+  switch (entry.type) {
+    case "message":
+      return entry.message;
+    case "custom_message":
+      return asAgentMessage(
         createCustomMessage(
           entry.customType,
           entry.content,
@@ -23,12 +25,37 @@ function appendContextMessage(messages: AgentMessage[], entry: SessionTreeEntry)
           entry.details,
           entry.timestamp,
         ),
-      ),
-    );
-  } else if (entry.type === "branch_summary" && entry.summary) {
-    messages.push(
-      asAgentMessage(createBranchSummaryMessage(entry.summary, entry.fromId, entry.timestamp)),
-    );
+      );
+    case "branch_summary":
+      return asAgentMessage(
+        createBranchSummaryMessage(entry.summary, entry.fromId, entry.timestamp),
+      );
+    case "compaction":
+      return asAgentMessage(
+        createCompactionSummaryMessage(entry.summary, entry.tokensBefore, entry.timestamp),
+      );
+    default:
+      return undefined;
+  }
+}
+
+function stripStalePrefixReplay(message: AgentMessage): AgentMessage {
+  return message.role === "assistant"
+    ? stripOpenAIResponsesCompactionReplayCheckpoint(message)
+    : message;
+}
+
+function appendContextMessage(
+  messages: AgentMessage[],
+  entry: SessionTreeEntry,
+  options?: { prefixWasRewritten?: boolean },
+): void {
+  if (entry.type === "compaction" || (entry.type === "branch_summary" && !entry.summary)) {
+    return;
+  }
+  const message = projectSessionEntryMessage(entry);
+  if (message) {
+    messages.push(options?.prefixWasRewritten ? stripStalePrefixReplay(message) : message);
   }
 }
 
@@ -37,7 +64,9 @@ function appendResetKeptMessage(messages: AgentMessage[], entry: SessionTreeEntr
     entry.type === "message" &&
     (entry.message.role === "user" || entry.message.role === "assistant")
   ) {
-    const message = { ...entry.message } as AgentMessage & { [SESSION_HISTORY_PRELUDE]?: true };
+    const message = { ...stripStalePrefixReplay(entry.message) } as AgentMessage & {
+      [SESSION_HISTORY_PRELUDE]?: true;
+    };
     Object.defineProperty(message, SESSION_HISTORY_PRELUDE, {
       configurable: true,
       enumerable: false,
@@ -68,19 +97,15 @@ export function buildSessionContext(pathEntries: SessionTreeEntry[]): SessionCon
   const messages: AgentMessage[] = [];
   if (boundary) {
     if (boundary.type === "compaction") {
-      messages.push(
-        asAgentMessage(
-          createCompactionSummaryMessage(
-            boundary.summary,
-            boundary.tokensBefore,
-            boundary.timestamp,
-          ),
-        ),
-      );
+      const summary = projectSessionEntryMessage(boundary);
+      if (summary) {
+        messages.push(summary);
+      }
     }
     const boundaryIdx = pathEntries.findIndex((entry) => entry.id === boundary.id);
     // A reset kept tail mirrors the old cross-log replay contract: only user/assistant
-    // rows survive. Compaction keeps its existing richer retained-tail behavior.
+    // rows survive. Both retained-tail forms now follow rewritten prefixes, so
+    // prefix-bound checkpoints are stale.
     let foundFirstKept = false;
     for (const entry of pathEntries.slice(0, boundaryIdx)) {
       if (entry.id === boundary.firstKeptEntryId) {
@@ -90,7 +115,7 @@ export function buildSessionContext(pathEntries: SessionTreeEntry[]): SessionCon
         if (boundary.type === "reset") {
           appendResetKeptMessage(messages, entry);
         } else {
-          appendContextMessage(messages, entry);
+          appendContextMessage(messages, entry, { prefixWasRewritten: true });
         }
       }
     }

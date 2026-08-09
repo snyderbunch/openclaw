@@ -20,7 +20,6 @@ import type {
   OpenClawPluginServiceContext,
   PluginLogger,
 } from "../runtime-api.js";
-import { registerAcpRuntimeBackend, unregisterAcpRuntimeBackend } from "../runtime-api.js";
 import { prepareAcpxCodexAuthConfig } from "./codex-auth-bridge.js";
 import { DEFAULT_ACPX_TIMEOUT_SECONDS } from "./config-schema.js";
 import {
@@ -58,7 +57,6 @@ type AcpxRuntimeLike = AcpRuntime & {
 };
 const ENABLE_STARTUP_PROBE_ENV = "OPENCLAW_ACPX_RUNTIME_STARTUP_PROBE";
 const SKIP_RUNTIME_PROBE_ENV = "OPENCLAW_SKIP_ACPX_RUNTIME_PROBE";
-const ACPX_BACKEND_ID = "acpx";
 
 type AcpxRuntimeFactoryParams = {
   pluginConfig: ResolvedAcpxPluginConfig;
@@ -68,7 +66,13 @@ type AcpxRuntimeFactoryParams = {
   logger?: PluginLogger;
 };
 
+type AcpxBackendLifecycle = {
+  publish: (backend: { runtime: AcpRuntime; healthy?: () => boolean }) => void;
+  retract: (runtime: AcpRuntime) => void;
+};
+
 type CreateAcpxRuntimeServiceParams = {
+  backendLifecycle: AcpxBackendLifecycle;
   pluginConfig?: unknown;
   openKeyedStore?: <T>(options: OpenKeyedStoreOptions) => PluginStateKeyedStore<T>;
   runtimeFactory?: (params: AcpxRuntimeFactoryParams) => AcpxRuntimeLike | Promise<AcpxRuntimeLike>;
@@ -127,25 +131,6 @@ function createLazyDefaultRuntime(params: AcpxRuntimeFactoryParams): AcpxRuntime
       return runtime?.isHealthy() ?? false;
     },
   };
-}
-
-function warnOnIgnoredLegacyCompatibilityConfig(params: {
-  pluginConfig: ResolvedAcpxPluginConfig;
-  logger?: PluginLogger;
-}): void {
-  const ignoredFields: string[] = [];
-  if (params.pluginConfig.legacyCompatibilityConfig.queueOwnerTtlSeconds != null) {
-    ignoredFields.push("queueOwnerTtlSeconds");
-  }
-  if (params.pluginConfig.legacyCompatibilityConfig.strictWindowsCmdWrapper === false) {
-    ignoredFields.push("strictWindowsCmdWrapper=false");
-  }
-  if (ignoredFields.length === 0) {
-    return;
-  }
-  params.logger?.warn(
-    `embedded acpx runtime ignores legacy compatibility config: ${ignoredFields.join(", ")}`,
-  );
 }
 
 function formatDoctorDetail(detail: unknown): string | null {
@@ -324,7 +309,7 @@ async function reapOpenAcpxProcessLeases(params: {
 
 /** Create the ACPX plugin service that owns runtime registration and cleanup. */
 export function createAcpxRuntimeService(
-  params: CreateAcpxRuntimeServiceParams = {},
+  params: CreateAcpxRuntimeServiceParams,
 ): OpenClawPluginService {
   let runtime: AcpxRuntimeLike | null = null;
   let lifecycleRevision = 0;
@@ -381,11 +366,6 @@ export function createAcpxRuntimeService(
           `reaped ${startupReap.terminatedPids.length} stale OpenClaw-owned ACPX process${startupReap.terminatedPids.length === 1 ? "" : "es"}`,
         );
       }
-      warnOnIgnoredLegacyCompatibilityConfig({
-        pluginConfig,
-        logger: ctx.logger,
-      });
-
       const startedRuntime = await measureAcpxStartup(ctx, "runtime.create", () =>
         params.runtimeFactory
           ? params.runtimeFactory({
@@ -411,11 +391,11 @@ export function createAcpxRuntimeService(
         ["probeAgent", pluginConfig.probeAgent ?? "default"],
       ]);
       await measureAcpxStartup(ctx, "backend.register", () => {
-        registerAcpRuntimeBackend({
-          id: ACPX_BACKEND_ID,
+        const backend = {
           runtime: startedRuntime,
           ...(shouldProbeRuntime ? { healthy: () => runtime?.isHealthy() ?? false } : {}),
-        });
+        };
+        params.backendLifecycle.publish(backend);
         ctx.logger.info(`embedded acpx runtime backend registered (cwd: ${pluginConfig.cwd})`);
       });
 
@@ -460,7 +440,9 @@ export function createAcpxRuntimeService(
     },
     async stop(_ctx: OpenClawPluginServiceContext): Promise<void> {
       lifecycleRevision += 1;
-      unregisterAcpRuntimeBackend(ACPX_BACKEND_ID);
+      if (runtime) {
+        params.backendLifecycle.retract(runtime);
+      }
       runtime = null;
     },
   };

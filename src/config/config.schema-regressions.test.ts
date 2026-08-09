@@ -3,6 +3,15 @@ import { describe, expect, it } from "vitest";
 import { validateConfigObject } from "./validation.js";
 
 describe("config schema regressions", () => {
+  it.each([true, false])("accepts and preserves gateway.cliAgents.enabled=%s", (enabled) => {
+    const result = validateConfigObject({ gateway: { cliAgents: { enabled } } });
+
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.config.gateway?.cliAgents?.enabled).toBe(enabled);
+    }
+  });
+
   it.each([0, 3_000])(
     "accepts the documented global exec approval running notice delay %i",
     (approvalRunningNoticeMs) => {
@@ -387,6 +396,31 @@ describe("config schema regressions", () => {
     const res = validateConfigObject({
       browser: {
         tabCleanup: {
+          unknownKey: true as unknown,
+        },
+      },
+    });
+
+    expect(res.ok).toBe(false);
+  });
+
+  it("accepts the browser extension relay legacy-auth migration gate", () => {
+    const res = validateConfigObject({
+      browser: {
+        extensionRelay: {
+          allowLegacyAuth: false,
+        },
+      },
+    });
+
+    expect(res.ok).toBe(true);
+  });
+
+  it("rejects unknown keys under browser.extensionRelay", () => {
+    const res = validateConfigObject({
+      browser: {
+        extensionRelay: {
+          allowLegacyAuth: true,
           unknownKey: true as unknown,
         },
       },
