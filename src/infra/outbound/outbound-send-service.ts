@@ -15,6 +15,7 @@ import type {
   ChannelThreadingToolContext,
 } from "../../channels/plugins/types.public.js";
 import { appendAssistantMessageToSessionTranscript } from "../../config/sessions.js";
+import { getOwnedSessionTranscriptWriterFence } from "../../config/sessions/transcript-write-context.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import {
   normalizeMessagePresentation,
@@ -94,6 +95,8 @@ type OutboundSendContext = {
   onDeliveryIntent?: (intent: DurableMessageSendIntent) => void;
   /** Runs on identified platform evidence before queue acknowledgement. */
   onDeliveryResult?: (result: OutboundDeliveryResult) => Promise<void> | void;
+  /** Runs once a plugin action accepted the send, before transcript mirroring. */
+  onPluginSendAccepted?: () => Promise<void>;
 };
 
 type PluginHandledResult = {
@@ -419,6 +422,9 @@ export async function executeSendAction(params: {
         ctx: pluginCtx,
         action: "send",
         onHandled: async () => {
+          // The accepted-send commit must precede the transcript mirror below:
+          // first-contact outbound routes create their session row in it.
+          await params.ctx.onPluginSendAccepted?.();
           if (!params.ctx.mirror) {
             return;
           }
@@ -431,10 +437,15 @@ export async function executeSendAction(params: {
             params.mediaUrls ??
             (params.mediaUrl ? [params.mediaUrl] : undefined);
           try {
+            const writerFence = getOwnedSessionTranscriptWriterFence();
             const mirrorResult = await appendAssistantMessageToSessionTranscript({
               agentId: params.ctx.mirror.agentId,
               sessionKey: params.ctx.mirror.sessionKey,
               expectedSessionId: params.ctx.mirror.expectedSessionId,
+              ...(writerFence?.expectedLifecycleRevision !== undefined
+                ? { expectedLifecycleRevision: writerFence.expectedLifecycleRevision }
+                : {}),
+              ...(writerFence ? { expectedWriterRunId: writerFence.expectedWriterRunId } : {}),
               text: mirrorText,
               mediaUrls: mirrorMediaUrls,
               idempotencyKey: params.ctx.mirror.idempotencyKey,

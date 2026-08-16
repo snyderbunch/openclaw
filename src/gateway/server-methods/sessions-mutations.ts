@@ -3,7 +3,6 @@ import { normalizeOptionalString } from "@openclaw/normalization-core/string-coe
 import {
   ErrorCodes,
   errorShape,
-  type SessionsPatchManyResult,
   validateSessionsPatchManyParams,
   validateSessionsPatchParams,
   validateSessionsPluginPatchParams,
@@ -12,9 +11,11 @@ import {
 import { patchPluginSessionExtension } from "../../plugins/host-hook-state.js";
 import { isPluginJsonValue } from "../../plugins/host-hooks.js";
 import { ADMIN_SCOPE } from "../operator-scopes.js";
+import { resolveRequestedSessionAgentId } from "../session-request-agent.js";
+import { resolveStoredSessionKeyForAgentStore } from "../session-store-key.js";
 import { emitSessionsChanged } from "./session-change-event.js";
 import { resolveOperatorSessionCreation } from "./session-creation-provenance.js";
-import { executeSessionPatchEngine } from "./sessions-patch-engine.js";
+import { executeSessionPatch, executeSessionPatchMany } from "./sessions-patch-engine.js";
 import { loadSessionsRuntimeModule, requireSessionKey } from "./sessions-shared.js";
 import type { GatewayRequestHandlers } from "./types.js";
 import { assertValidParams } from "./validation.js";
@@ -32,8 +33,7 @@ export const sessionMutationHandlers: GatewayRequestHandlers = {
     ) {
       return;
     }
-    const executed = await executeSessionPatchEngine({
-      authorizationMode: "target",
+    const executed = await executeSessionPatchMany({
       client,
       context,
       patch: params.patch,
@@ -44,15 +44,7 @@ export const sessionMutationHandlers: GatewayRequestHandlers = {
       respond(false, undefined, executed.error);
       return;
     }
-    const outcomes: SessionsPatchManyResult["outcomes"] = executed.outcomes.map((outcome) => {
-      if (!outcome.ok) {
-        return outcome;
-      }
-      return outcome.agentId
-        ? { ok: true, key: outcome.key, agentId: outcome.agentId }
-        : { ok: true, key: outcome.key };
-    });
-    respond(true, { outcomes } satisfies SessionsPatchManyResult, undefined);
+    respond(true, { outcomes: executed.outcomes }, undefined);
   },
   "sessions.patch": async ({ params, respond, context, client, sessionMutationAuthorization }) => {
     if (!assertValidParams(params, validateSessionsPatchParams, "sessions.patch", respond)) {
@@ -62,63 +54,17 @@ export const sessionMutationHandlers: GatewayRequestHandlers = {
     if (!key) {
       return;
     }
-    const executed = await executeSessionPatchEngine({
-      authorizationMode: "request",
+    const executed = await executeSessionPatch({
       client,
       context,
-      patch: params,
+      patch: { ...params, key },
       sessionMutationAuthorization,
-      targets: [
-        {
-          key,
-          ...(params.agentId ? { agentId: params.agentId } : {}),
-          ...(params.expectedSessionId !== undefined
-            ? { expectedSessionId: params.expectedSessionId }
-            : {}),
-          ...(params.expectedLifecycleRevision !== undefined
-            ? { expectedLifecycleRevision: params.expectedLifecycleRevision }
-            : {}),
-        },
-      ],
     });
     if (!executed.ok) {
       respond(false, undefined, executed.error);
       return;
     }
-    const outcome = executed.outcomes[0];
-    if (!outcome) {
-      respond(
-        false,
-        undefined,
-        errorShape(
-          ErrorCodes.UNAVAILABLE,
-          "Session patch failed unexpectedly. Retry the request.",
-          {
-            retryable: true,
-          },
-        ),
-      );
-      return;
-    }
-    if (!outcome.ok) {
-      respond(false, undefined, outcome.error);
-      return;
-    }
-    if (!outcome.result) {
-      respond(
-        false,
-        undefined,
-        errorShape(
-          ErrorCodes.UNAVAILABLE,
-          "Session patch failed unexpectedly. Retry the request.",
-          {
-            retryable: true,
-          },
-        ),
-      );
-      return;
-    }
-    respond(true, outcome.result, undefined);
+    respond(true, executed.result, undefined);
   },
   "sessions.pluginPatch": async ({
     params,
@@ -180,9 +126,24 @@ export const sessionMutationHandlers: GatewayRequestHandlers = {
       );
       return;
     }
+    const requestedAgent = resolveRequestedSessionAgentId(
+      context.getRuntimeConfig(),
+      key,
+      params.agentId,
+    );
+    if (!requestedAgent.ok) {
+      respond(false, undefined, requestedAgent.error);
+      return;
+    }
+    const canonicalKey = resolveStoredSessionKeyForAgentStore({
+      cfg: context.getRuntimeConfig(),
+      agentId: requestedAgent.agentId,
+      sessionKey: key,
+    });
     const patched = await patchPluginSessionExtension({
       cfg: context.getRuntimeConfig(),
-      sessionKey: key,
+      sessionKey: canonicalKey,
+      agentId: requestedAgent.agentId,
       pluginId,
       namespace,
       value: params.value,
@@ -196,6 +157,7 @@ export const sessionMutationHandlers: GatewayRequestHandlers = {
     respond(true, { ok: true, key: patched.key, value: patched.value }, undefined);
     emitSessionsChanged(context, {
       sessionKey: patched.key,
+      agentId: requestedAgent.agentId,
       reason: "plugin-patch",
     });
   },
@@ -227,9 +189,11 @@ export const sessionMutationHandlers: GatewayRequestHandlers = {
     }
     if ("incognitoDeleted" in result) {
       respond(true, { ok: true, key: result.key, deleted: true }, undefined);
+      // The session is gone, not reset: clients drop rows and navigate away
+      // only on "delete" (a non-delete reason merges a rowless no-op event).
       emitSessionsChanged(context, {
         sessionKey: result.key,
-        reason,
+        reason: "delete",
       });
       return;
     }
@@ -240,7 +204,7 @@ export const sessionMutationHandlers: GatewayRequestHandlers = {
     );
     emitSessionsChanged(context, {
       sessionKey: result.key,
-      ...(result.key === "global" ? { agentId: result.agentId } : {}),
+      agentId: result.agentId,
       reason,
     });
   },

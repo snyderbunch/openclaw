@@ -42,6 +42,7 @@ export function enqueuePendingSendMessage(
   sendState?: ChatQueueItem["sendState"],
   skillWorkshopRevision?: ChatQueueItem["skillWorkshopRevision"],
   replyToId?: string,
+  resumedOrderKey?: number,
 ): ChatQueueItem | null {
   const trimmed = text.trim();
   const hasAttachments = Boolean(attachments && attachments.length > 0);
@@ -49,10 +50,13 @@ export function enqueuePendingSendMessage(
     return null;
   }
   const sender = resolveCurrentUserIdentity(host.hello, host.client?.instanceId);
+  // A send that resumes an edited row inherits its place; the row itself is
+  // retired by the write that admits this replacement, not here.
   const pending: ChatQueueItem = {
     id: generateUUID(),
     text: trimmed,
     createdAt: Date.now(),
+    ...(resumedOrderKey !== undefined ? { orderKey: resumedOrderKey } : {}),
     attachments: hasAttachments ? attachments : undefined,
     refreshSessions,
     sendAttempts: 0,
@@ -79,7 +83,7 @@ export function enqueuePendingSendMessage(
     recordChatSendTiming(host, pending, sendState, submittedAtMs);
   }
   schedulePendingSendPaintTiming(host, pending, submittedAtMs);
-  scheduleChatScroll(host as unknown as Parameters<typeof scheduleChatScroll>[0], true, false, {
+  scheduleChatScroll(host, true, false, {
     source: "manual",
   });
   return pending;

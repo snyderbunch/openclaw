@@ -1,19 +1,12 @@
 // Chutes tests cover implicit provider plugin behavior.
 import { registerSingleProviderPlugin } from "openclaw/plugin-sdk/plugin-test-runtime";
 import { resolveOAuthApiKeyMarker } from "openclaw/plugin-sdk/provider-auth";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import plugin from "./index.js";
 import { CHUTES_BASE_URL } from "./models.js";
+import { refreshChutesOAuthCredential } from "./oauth.js";
 
 const CHUTES_OAUTH_MARKER = resolveOAuthApiKeyMarker("chutes");
-
-function restoreEnvVar(name: string, value: string | undefined): void {
-  if (value === undefined) {
-    delete process.env[name];
-  } else {
-    process.env[name] = value;
-  }
-}
 
 function jsonResponse(payload: unknown, init: ResponseInit = {}): Response {
   return new Response(JSON.stringify(payload), {
@@ -46,12 +39,7 @@ async function runChutesCatalogProvider(params: { apiKey: string; discoveryApiKe
 async function withRealChutesDiscovery<T>(
   run: (fetchMock: ReturnType<typeof vi.fn>) => Promise<T>,
 ) {
-  const originalVitest = process.env.VITEST;
-  const originalNodeEnv = process.env.NODE_ENV;
   const originalFetch = globalThis.fetch;
-  delete process.env.VITEST;
-  delete process.env.NODE_ENV;
-
   const fetchMock = vi
     .fn()
     .mockResolvedValue(jsonResponse({ data: [{ id: "chutes/private-model" }] }));
@@ -60,19 +48,11 @@ async function withRealChutesDiscovery<T>(
   try {
     return await run(fetchMock);
   } finally {
-    restoreEnvVar("VITEST", originalVitest);
-    restoreEnvVar("NODE_ENV", originalNodeEnv);
     globalThis.fetch = originalFetch;
   }
 }
 
 describe("chutes implicit provider auth mode", () => {
-  afterEach(() => {
-    vi.restoreAllMocks();
-    vi.unstubAllEnvs();
-    vi.unstubAllGlobals();
-  });
-
   it("publishes the env vars used by core api-key auto-detection", async () => {
     const provider = await registerSingleProviderPlugin(plugin);
 
@@ -80,36 +60,9 @@ describe("chutes implicit provider auth mode", () => {
   });
 
   it("registers plugin-owned OAuth refresh behavior", async () => {
-    vi.stubEnv("CHUTES_CLIENT_SECRET", "");
-    const fetchMock = vi.fn(async () =>
-      jsonResponse({ access_token: "at_new", refresh_token: "rt_new", expires_in: 1800 }),
-    );
-    vi.stubGlobal("fetch", fetchMock);
     const provider = await registerSingleProviderPlugin(plugin);
-    const credential = {
-      type: "oauth" as const,
-      provider: "chutes",
-      access: "at_old",
-      refresh: "rt_old",
-      expires: 1,
-      clientId: "cid_test",
-      email: "fred@example.com",
-    };
 
-    expect(provider.refreshOAuth).toBeTypeOf("function");
-    await expect(provider.refreshOAuth!(credential)).resolves.toMatchObject({
-      type: "oauth",
-      provider: "chutes",
-      access: "at_new",
-      refresh: "rt_new",
-      clientId: "cid_test",
-      email: "fred@example.com",
-    });
-    expect(fetchMock).toHaveBeenCalledOnce();
-    expect(fetchMock).toHaveBeenCalledWith(
-      "https://api.chutes.ai/idp/token",
-      expect.objectContaining({ method: "POST" }),
-    );
+    expect(provider.refreshOAuth).toBe(refreshChutesOAuthCredential);
   });
 
   it("does not publish a provider when no API key is resolved", async () => {
@@ -117,21 +70,25 @@ describe("chutes implicit provider auth mode", () => {
   });
 
   it("keeps api-key resolved Chutes profiles on the API-key loader path", async () => {
-    const provider = await runChutesCatalogProvider({ apiKey: "chutes-live-api-key" });
+    await withRealChutesDiscovery(async () => {
+      const provider = await runChutesCatalogProvider({ apiKey: "chutes-live-api-key" });
 
-    expect(provider.baseUrl).toBe(CHUTES_BASE_URL);
-    expect(provider.apiKey).toBe("chutes-live-api-key");
-    expect(provider.apiKey).not.toBe(CHUTES_OAUTH_MARKER);
+      expect(provider.baseUrl).toBe(CHUTES_BASE_URL);
+      expect(provider.apiKey).toBe("chutes-live-api-key");
+      expect(provider.apiKey).not.toBe(CHUTES_OAUTH_MARKER);
+    });
   });
 
   it("uses the OAuth marker only for oauth-backed Chutes profiles", async () => {
-    const provider = await runChutesCatalogProvider({
-      apiKey: CHUTES_OAUTH_MARKER,
-      discoveryApiKey: "oauth-access-token",
-    });
+    await withRealChutesDiscovery(async () => {
+      const provider = await runChutesCatalogProvider({
+        apiKey: CHUTES_OAUTH_MARKER,
+        discoveryApiKey: "oauth-access-token",
+      });
 
-    expect(provider.baseUrl).toBe(CHUTES_BASE_URL);
-    expect(provider.apiKey).toBe(CHUTES_OAUTH_MARKER);
+      expect(provider.baseUrl).toBe(CHUTES_BASE_URL);
+      expect(provider.apiKey).toBe(CHUTES_OAUTH_MARKER);
+    });
   });
 
   it("forwards oauth access token to Chutes model discovery", async () => {

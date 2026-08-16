@@ -8,7 +8,6 @@ import {
   ErrorCodes,
   type ErrorShape,
   errorShape,
-  normalizeSessionIconInput,
   type SessionCreatedActor,
   type SessionsPatchParams,
 } from "../../packages/gateway-protocol/src/index.js";
@@ -61,6 +60,7 @@ import {
 import { normalizeSendPolicy } from "../sessions/send-policy.js";
 import {
   isSessionAgentAttentionIconId,
+  normalizeSessionIconValue,
   resolveActiveSessionAgentStatus,
   sanitizeSessionAgentStatusNote,
   sessionAgentStatusExpiresAt,
@@ -181,6 +181,14 @@ export async function projectSessionsPatchEntry(params: {
   if (harnessSessionError) {
     return invalid(harnessSessionError);
   }
+  if (typeof patch.archived === "boolean") {
+    if (!params.existingEntry?.sessionId) {
+      return invalid(`session not found: ${storeKey}`);
+    }
+    if (patch.expectedSessionId === undefined) {
+      return invalid(`expectedSessionId required for session lifecycle patch: ${storeKey}`);
+    }
+  }
   if ("model" in patch && isModelSelectionLocked(params.existingEntry)) {
     return invalid(MODEL_SELECTION_LOCKED_MESSAGE);
   }
@@ -200,7 +208,11 @@ export async function projectSessionsPatchEntry(params: {
   ): string => {
     // ACP metadata can own canonical agent keys (for example agent:main:main),
     // so key shape alone cannot identify the runtime that validates thinking.
-    const acpMeta = readAcpSessionMetaForEntry({ sessionKey: storeKey, entry });
+    const acpMeta = readAcpSessionMetaForEntry({
+      sessionKey: storeKey,
+      agentId: sessionAgentId,
+      entry,
+    });
     return (
       acpMeta?.backend ??
       resolveEffectiveAgentRuntime({
@@ -227,7 +239,7 @@ export async function projectSessionsPatchEntry(params: {
   };
 
   const existing = params.existingEntry
-    ? projectCanonicalSessionEntryShape(params.existingEntry as unknown as Record<string, unknown>)
+    ? projectCanonicalSessionEntryShape({ ...params.existingEntry })
     : undefined;
   // Existing entries without session ids are placeholder aliases; assigning an id makes them real.
   const next: SessionEntry = existing?.sessionId
@@ -272,6 +284,19 @@ export async function projectSessionsPatchEntry(params: {
     }
   }
 
+  if ("icon" in patch) {
+    const raw = patch.icon;
+    if (raw === null || raw === "") {
+      delete next.icon;
+    } else if (raw !== undefined) {
+      const icon = normalizeSessionIconValue(raw);
+      if (!icon) {
+        return invalid("icon must be a single emoji");
+      }
+      next.icon = icon;
+    }
+  }
+
   if ("category" in patch) {
     const raw = patch.category;
     if (raw === null) {
@@ -291,19 +316,6 @@ export async function projectSessionsPatchEntry(params: {
 
   if ("boardFace" in patch && patch.boardFace !== undefined) {
     next.boardFace = patch.boardFace;
-  }
-
-  if ("icon" in patch) {
-    const raw = patch.icon;
-    if (raw === null) {
-      delete next.icon;
-    } else if (raw !== undefined) {
-      const normalized = normalizeSessionIconInput(raw);
-      if (!normalized.ok) {
-        return invalid(`invalid icon: ${normalized.reason}`);
-      }
-      next.icon = normalized.value;
-    }
   }
 
   if ("statusNote" in patch || "attention" in patch || "ttlMinutes" in patch) {
@@ -580,14 +592,20 @@ export async function projectSessionsPatchEntry(params: {
       if (!params.loadGatewayModelCatalog) {
         return {
           ok: false,
-          error: errorShape(ErrorCodes.UNAVAILABLE, "model catalog unavailable"),
+          error: errorShape(
+            ErrorCodes.UNAVAILABLE,
+            "model catalog is still loading; retry in a few seconds",
+          ),
         };
       }
       const catalog = await loadPreparedModelCatalogForPatch();
       if (!catalog) {
         return {
           ok: false,
-          error: errorShape(ErrorCodes.UNAVAILABLE, "model catalog unavailable"),
+          error: errorShape(
+            ErrorCodes.UNAVAILABLE,
+            "model catalog is still loading; retry in a few seconds",
+          ),
         };
       }
       const resolved = resolveSessionPatchModelSelection({
@@ -697,38 +715,4 @@ export async function projectSessionsPatchEntry(params: {
   }
 
   return { ok: true, entry: next };
-}
-
-/** Apply a validated gateway session patch to an in-memory session store entry. */
-export async function applySessionsPatchToStore(params: {
-  cfg: OpenClawConfig;
-  store: Record<string, SessionEntry>;
-  storeKey: string;
-  agentId?: string;
-  patch: SessionsPatchParams;
-  archivedBy?: SessionCreatedActor;
-  loadGatewayModelCatalog?: () => Promise<ModelCatalogEntry[]>;
-  providerAuthMetadataSnapshot?: Pick<PluginMetadataSnapshot, "plugins">;
-  /** Exact harness owner authorized to project its new reserved session row. */
-  authorizedAgentHarnessId?: string;
-}): Promise<{ ok: true; entry: SessionEntry } | { ok: false; error: ErrorShape }> {
-  const projected = await projectSessionsPatchEntry({
-    cfg: params.cfg,
-    existingEntry: params.store[params.storeKey],
-    isLabelInUse: (label) =>
-      Object.entries(params.store).some(
-        ([sessionKey, entry]) => sessionKey !== params.storeKey && entry.label === label,
-      ),
-    storeKey: params.storeKey,
-    agentId: params.agentId,
-    patch: params.patch,
-    archivedBy: params.archivedBy,
-    loadGatewayModelCatalog: params.loadGatewayModelCatalog,
-    providerAuthMetadataSnapshot: params.providerAuthMetadataSnapshot,
-    authorizedAgentHarnessId: params.authorizedAgentHarnessId,
-  });
-  if (projected.ok) {
-    params.store[params.storeKey] = projected.entry;
-  }
-  return projected;
 }
