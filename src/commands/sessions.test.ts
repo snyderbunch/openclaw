@@ -1,7 +1,9 @@
 // Sessions command tests cover listing, details, filtering, and transcript display behavior.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { ExpectedCliError } from "../cli/failure-output.js";
 import {
   assignSessionOwner,
+  patchSessionEntryCore,
   recordSessionParticipant,
 } from "../config/sessions/session-accessor.js";
 import type { SessionEntry } from "../config/sessions/types.js";
@@ -16,9 +18,6 @@ import {
   writeStore,
 } from "./sessions.test-helpers.js";
 
-// Disable colors for deterministic snapshots.
-process.env.FORCE_COLOR = "0";
-
 mockSessionsConfig();
 
 import { sessionsCommand } from "./sessions.js";
@@ -31,6 +30,7 @@ describe("sessionsCommand", () => {
 
   afterEach(() => {
     resetMockSessionsConfig();
+    vi.restoreAllMocks();
     vi.useRealTimers();
   });
 
@@ -314,7 +314,12 @@ describe("sessionsCommand", () => {
           updatedAt: Date.now() - 60_000,
           model: "test:opus",
           visibility: "suggest",
-          createdActor: { type: "human", id: "profile-creator", label: "Creator" },
+          createdActor: {
+            type: "human",
+            source: "profile",
+            id: "profile-creator",
+            label: "Creator",
+          },
         },
       },
       "sessions-collaboration",
@@ -325,16 +330,9 @@ describe("sessionsCommand", () => {
       assignedBy: { type: "human", id: "profile-admin", label: "Admin" },
       assignedAt: Date.now() - 30_000,
     });
-    for (const [id, label] of [
-      ["profile-ada", "Ada"],
-      ["profile-ben", "Ben"],
-      ["profile-cam", "Cam"],
-      ["profile-dee", "Dee"],
-      ["profile-eli", "Eli"],
-    ] as const) {
+    for (const id of ["profile-ada", "profile-ben", "profile-cam", "profile-dee", "profile-eli"]) {
       recordSessionParticipant(scope, {
-        actor: { type: "human", id, label },
-        source: "profile",
+        identity: { type: "profile", id },
       });
     }
 
@@ -342,7 +340,7 @@ describe("sessionsCommand", () => {
     await sessionsCommand({ store }, runtime);
     const row = logs.find((line) => line.includes(sessionKey)) ?? "";
     expect(row).toContain(
-      "visibility:suggest owner:profile-owner participants:profile-ada,profile-ben,profile-cam,profile-dee,+1",
+      "visibility:suggest owner:profile-owner participants:profile:profile-ada,profile:profile-ben,profile:profile-cam,profile:profile-dee,+1",
     );
 
     const payload = await runSessionsJson<{
@@ -367,11 +365,11 @@ describe("sessionsCommand", () => {
       },
       participantCount: 5,
       participants: [
-        { type: "human", id: "profile-ada", source: "profile" },
-        { type: "human", id: "profile-ben", source: "profile" },
-        { type: "human", id: "profile-cam", source: "profile" },
-        { type: "human", id: "profile-dee", source: "profile" },
-        { type: "human", id: "profile-eli", source: "profile" },
+        { identity: { type: "profile", id: "profile-ada" } },
+        { identity: { type: "profile", id: "profile-ben" } },
+        { identity: { type: "profile", id: "profile-cam" } },
+        { identity: { type: "profile", id: "profile-dee" } },
+        { identity: { type: "profile", id: "profile-eli" } },
       ],
     });
     expect(shared).not.toHaveProperty("sharingRole");
@@ -413,7 +411,7 @@ describe("sessionsCommand", () => {
     ]);
   });
 
-  it("exports subagent lineage metadata in JSON output", async () => {
+  it("exports session color and subagent lineage metadata in JSON output", async () => {
     const store = await writeStore({
       "agent:main:child": {
         sessionId: "child-session",
@@ -429,10 +427,22 @@ describe("sessionsCommand", () => {
         sessionStartedAt: Date.now() - 20 * 60_000,
         lastInteractionAt: Date.now() - 5 * 60_000,
         label: "research helper",
+        color: "blue",
         status: "done",
         model: "test:opus",
       },
+      "agent:main:uncolored": { sessionId: "uncolored-session", updatedAt: Date.now() },
+      "agent:main:cleared": {
+        sessionId: "cleared-session",
+        updatedAt: Date.now(),
+        color: "red",
+      },
     });
+    await patchSessionEntryCore(
+      { agentId: "main", sessionKey: "agent:main:cleared", storePath: store },
+      () => ({ color: undefined }),
+      { skipMaintenance: true },
+    );
 
     const payload = await runSessionsJson<{
       sessions?: Array<{
@@ -448,6 +458,7 @@ describe("sessionsCommand", () => {
         sessionStartedAt?: number;
         lastInteractionAt?: number;
         label?: string;
+        color?: string;
         status?: string;
       }>;
     }>(sessionsCommand, store);
@@ -465,9 +476,15 @@ describe("sessionsCommand", () => {
       sessionStartedAt: Date.now() - 20 * 60_000,
       lastInteractionAt: Date.now() - 5 * 60_000,
       label: "research helper",
+      color: "blue",
       status: "done",
     });
     expect(child).not.toHaveProperty("sessionFile");
+    for (const key of ["agent:main:uncolored", "agent:main:cleared"]) {
+      const row = payload.sessions?.find((session) => session.key === key);
+      expect(row).toBeDefined();
+      expect(row).not.toHaveProperty("color");
+    }
   });
 
   it("shows preserved stale totals in JSON output", async () => {
@@ -727,63 +744,45 @@ describe("sessionsCommand", () => {
     ]);
   });
 
-  it("rejects invalid --active values", async () => {
-    const store = await writeStore(
-      {
-        "agent:main:demo": {
-          sessionId: "demo",
-          updatedAt: Date.now() - 5 * 60_000,
-        },
-      },
-      "sessions-active-invalid",
+  it.each([
+    {
+      name: "invalid active minutes",
+      options: { active: "0" },
+      message: "--active must be a positive number of minutes, for example --active 30.",
+    },
+    {
+      name: "partially numeric active minutes",
+      options: { active: "10m" },
+      message: "--active must be a positive number of minutes, for example --active 30.",
+    },
+    {
+      name: "an invalid limit",
+      options: { limit: "0" },
+      message: '--limit must be a positive integer or "all", for example --limit 25.',
+    },
+    {
+      name: "active minutes before an invalid limit",
+      options: { active: "0", limit: "0" },
+      message: "--active must be a positive number of minutes, for example --active 30.",
+    },
+  ])("rejects $name before reading session stores", async ({ options, message }) => {
+    const listSessionEntries = vi.spyOn(
+      await import("../config/sessions/session-accessor.js"),
+      "listSessionEntriesReadOnly",
     );
-    const { runtime, errors } = makeRuntime();
+    const { runtime, logs, errors } = makeRuntime();
+    const runtimeExit = vi.spyOn(runtime, "exit");
+    const execution = sessionsCommand(options, runtime);
 
-    await expect(sessionsCommand({ store, active: "0" }, runtime)).rejects.toThrow("exit 1");
-    expect(errors).toStrictEqual([
-      "--active must be a positive number of minutes, for example --active 30.",
-    ]);
-
-    cleanupStore(store);
-  });
-
-  it("rejects partial --active values", async () => {
-    const store = await writeStore(
-      {
-        "agent:main:demo": {
-          sessionId: "demo",
-          updatedAt: Date.now() - 5 * 60_000,
-        },
-      },
-      "sessions-active-partial",
-    );
-    const { runtime, errors } = makeRuntime();
-
-    await expect(sessionsCommand({ store, active: "10m" }, runtime)).rejects.toThrow("exit 1");
-    expect(errors).toStrictEqual([
-      "--active must be a positive number of minutes, for example --active 30.",
-    ]);
-
-    cleanupStore(store);
-  });
-
-  it("rejects invalid --limit values", async () => {
-    const store = await writeStore(
-      {
-        "agent:main:demo": {
-          sessionId: "demo",
-          updatedAt: Date.now() - 5 * 60_000,
-        },
-      },
-      "sessions-limit-invalid",
-    );
-    const { runtime, errors } = makeRuntime();
-
-    await expect(sessionsCommand({ store, limit: "0" }, runtime)).rejects.toThrow("exit 1");
-    expect(errors).toStrictEqual([
-      '--limit must be a positive integer or "all", for example --limit 25.',
-    ]);
-
-    cleanupStore(store);
+    await expect(execution).rejects.toBeInstanceOf(ExpectedCliError);
+    await expect(execution).rejects.toMatchObject({
+      message,
+      humanOutput: message,
+      machineOutput: message,
+    });
+    expect(logs).toEqual([]);
+    expect(errors).toEqual([]);
+    expect(runtimeExit).not.toHaveBeenCalled();
+    expect(listSessionEntries).not.toHaveBeenCalled();
   });
 });

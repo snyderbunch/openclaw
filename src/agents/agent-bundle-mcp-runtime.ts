@@ -14,33 +14,19 @@ import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/string-coerce";
 import type { SessionToolOverrides } from "../config/sessions/types.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
+import { racePromiseWithAbortSignal } from "../infra/abort-signal.js";
 import { logWarn } from "../logger.js";
 import type { PluginManifestRegistry } from "../plugins/manifest-registry.js";
 import { runTasksWithConcurrency } from "../utils/run-with-concurrency.js";
 import { mergeMcpToolCatalogs } from "./agent-bundle-mcp-combined.js";
 import {
-  completeDeferredSessionMcpRuntimeRetirement,
   disposeAllSessionMcpRuntimes,
-  getAdvertisedScopedMcpCatalog,
-  getOrCreateRequesterScopedMcpRuntime,
-  getOrCreateSessionMcpRuntime,
   getSessionMcpRuntimeManagerForTesting,
-  peekSessionMcpRuntime,
-  rememberAdvertisedScopedMcpCatalog,
-  retireSessionMcpRuntime,
-  retireSessionMcpRuntimeForSessionKey,
 } from "./agent-bundle-mcp-manager-api.js";
-import {
-  createSessionMcpRuntimeManager,
-  setDefaultCreateSessionMcpRuntime,
-} from "./agent-bundle-mcp-manager.js";
+import { createSessionMcpRuntimeManager } from "./agent-bundle-mcp-manager.js";
 import { assignSafeServerNames, sanitizeServerName } from "./agent-bundle-mcp-names.js";
 import { getSessionMcpRequestSignal } from "./agent-bundle-mcp-request-context.js";
-import {
-  loadSessionMcpConfig,
-  resolveSessionMcpConfigSummary,
-} from "./agent-bundle-mcp-runtime-config.js";
-import { resolveSessionMcpRuntimeIdleTtlMs } from "./agent-bundle-mcp-runtime-shared.js";
+import { loadSessionMcpConfig } from "./agent-bundle-mcp-runtime-config.js";
 import type {
   McpCatalogTool,
   McpRequestOptions,
@@ -967,7 +953,9 @@ export function createSessionMcpRuntime(params: {
     return staleCatalog;
   };
   const getActiveSession = async (serverName: string) => {
-    await getCatalog();
+    const signal = getSessionMcpRequestSignal();
+    signal?.throwIfAborted();
+    await racePromiseWithAbortSignal(getCatalog(), signal);
     return requireConnectedSession(serverName);
   };
 
@@ -1096,23 +1084,6 @@ export function createSessionMcpRuntime(params: {
   return runtime;
 }
 
-setDefaultCreateSessionMcpRuntime(createSessionMcpRuntime);
-
-export {
-  completeDeferredSessionMcpRuntimeRetirement,
-  disposeAllSessionMcpRuntimes,
-  getAdvertisedScopedMcpCatalog,
-  getOrCreateRequesterScopedMcpRuntime,
-  getOrCreateSessionMcpRuntime,
-  peekSessionMcpRuntime,
-  rememberAdvertisedScopedMcpCatalog,
-  resolveSessionMcpConfigSummary,
-  retireSessionMcpRuntime,
-  retireSessionMcpRuntimeForSessionKey,
-};
-export { createSessionMcpRuntimeManager };
-export { mergeMcpToolCatalogs };
-
 export const testing = {
   buildMcpClientCapabilities,
   createSessionMcpRuntimeManager,
@@ -1141,7 +1112,6 @@ export const testing = {
   },
   setBundleMcpCatalogListTimeoutMsForTest,
   setBundleMcpDisposeTimeoutMsForTest,
-  resolveSessionMcpRuntimeIdleTtlMs,
   mergeMcpToolCatalogs,
 };
 /* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */

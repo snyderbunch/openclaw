@@ -189,7 +189,7 @@ export const DEFAULT_REDACT_PATTERNS: readonly string[] = [
   String.raw`(eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,})`,
   String.raw`(pplx-[A-Za-z0-9_-]{10,})`,
   String.raw`(fal_[A-Za-z0-9_-]{10,})`,
-  String.raw`(fc-[A-Za-z0-9]{10,})`,
+  String.raw`${IDENTIFIER_SAFE_TOKEN_BOUNDARY}(fc-[A-Za-z0-9]{10,})`,
   String.raw`(bb_live_[A-Za-z0-9_-]{10,})`,
   String.raw`${BASE64_SAFE_TOKEN_BOUNDARY}(gAAAA[A-Za-z0-9_=-]{20,})`,
   String.raw`(sk_live_[A-Za-z0-9]{10,})`,
@@ -248,7 +248,7 @@ export const DEFAULT_REDACT_PATTERNS: readonly string[] = [
   AWS_SECRET_ACCESS_KEY_VALUE_REDACT_PATTERN,
 ];
 
-const TOOL_PAYLOAD_AMBIGUOUS_ASSIGNMENT_PATTERNS = new Set([
+export const TOOL_PAYLOAD_AMBIGUOUS_ASSIGNMENT_PATTERNS = new Set([
   ENV_ASSIGNMENT_REDACT_PATTERN,
   ESCAPED_ENV_ASSIGNMENT_REDACT_PATTERN,
   STRUCTURED_JSON_SECRET_REDACT_PATTERN,

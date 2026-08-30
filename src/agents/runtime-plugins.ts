@@ -1,6 +1,10 @@
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { adoptRuntimeContextEngineRegistrations } from "../context-engine/registry.js";
-import { listRuntimePluginIdsFromRegistry } from "../plugins/active-runtime-registry.js";
+import {
+  listLoadedRuntimePluginIds,
+  listRuntimePluginIdsFromRegistry,
+  registryContainsRuntimePluginIds,
+} from "../plugins/active-runtime-registry.js";
 import { normalizePluginsConfig } from "../plugins/config-state.js";
 import { extractPluginInstallRecordsFromInstalledPluginIndex } from "../plugins/installed-plugin-index-install-records.js";
 import { loadPluginRegistryHandle } from "../plugins/loader.js";
@@ -27,6 +31,8 @@ type AgentRuntimePluginRegistryParams = {
   allowGatewaySubagentBinding?: boolean;
   /** Explicit base scope for hosts without a Gateway startup registry. */
   basePluginIds?: readonly string[];
+  /** Exact registry from the supplied lifecycle metadata generation. */
+  reusableRegistry?: PluginRegistry;
   selections?: readonly AgentHarnessPluginSelection[];
   /** Lifecycle-owned selection; standalone/direct generations stay source-default. */
   preferBuiltPluginArtifacts?: boolean;
@@ -68,6 +74,9 @@ function resolveAgentRuntimePluginRegistryLoad(params: AgentRuntimePluginRegistr
     ...(workspaceDir ? { workspaceDir } : {}),
   };
   const requestPluginRegistry = getPluginRuntimeGatewayRequestScope()?.pluginRegistry;
+  // Gateway-hosted fall-through must not cold-load every plugin (30-45s event-loop convoy);
+  // startup runtime plugin ids plus selected run owners bound the registry scope.
+  const activePluginIds = listLoadedRuntimePluginIds();
   const startupPluginIds =
     params.basePluginIds !== undefined
       ? [...params.basePluginIds]
@@ -75,7 +84,9 @@ function resolveAgentRuntimePluginRegistryLoad(params: AgentRuntimePluginRegistr
         ? listRuntimePluginIdsFromRegistry(requestPluginRegistry)
         : metadataSnapshot.pluginIds
           ? [...metadataSnapshot.pluginIds]
-          : undefined;
+          : activePluginIds.length > 0
+            ? activePluginIds
+            : undefined;
   const planParams = {
     config: params.config,
     workspaceDir: workspaceDir ?? process.cwd(),
@@ -106,6 +117,13 @@ export function loadAgentRuntimePluginRegistryHandle(
   params: AgentRuntimePluginRegistryParams,
 ): PluginRegistry {
   const load = resolveAgentRuntimePluginRegistryLoad(params);
+  if (
+    params.reusableRegistry &&
+    load.loadOptions.onlyPluginIds !== undefined &&
+    registryContainsRuntimePluginIds(params.reusableRegistry, load.loadOptions.onlyPluginIds)
+  ) {
+    return params.reusableRegistry;
+  }
   // Discovery-only load: full mode can replace process-global sandbox backends.
   // Adopt full-only runtime capabilities from the matching composition-root owners.
   const pluginRegistry = loadPluginRegistryHandle({ ...load.loadOptions, activate: false });

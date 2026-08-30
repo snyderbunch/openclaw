@@ -1,6 +1,7 @@
 import type { ProgressCard } from "@openclaw/gateway-protocol";
 import { bucketRelativeTimeMs, type RelativeTimeUnit } from "@openclaw/normalization-core";
-import { html, nothing } from "lit";
+import { html, nothing, type TemplateResult } from "lit";
+import type { SessionParticipant } from "../../../packages/gateway-protocol/src/schema/session-participant.js";
 import type {
   ControlUiSessionPullRequest,
   ControlUiSessionPullRequestSnapshot,
@@ -8,18 +9,49 @@ import type {
 import { i18n, t } from "../i18n/index.ts";
 import type { SidebarSessionHovercardRow } from "./app-sidebar-session-types.ts";
 import { icons } from "./icons.ts";
-import { sessionOwnerInitials } from "./session-owner-chip.ts";
+import {
+  personActivityLink,
+  renderPersonAvatarLink,
+  renderPersonName,
+  type PersonActivityRouting,
+} from "./person-activity-link.ts";
+import { renderSessionColorDot } from "./session-color.ts";
+import { sessionOwnerInitials, type SessionCreatedActor } from "./session-owner-chip.ts";
 import { renderSessionProgressCard } from "./session-progress-card.ts";
 import "./viewer-facepile.ts";
 
 const MAX_VISIBLE_PULL_REQUESTS = 4;
 const MAX_VISIBLE_PARTICIPANTS = 3;
 
+function participantLabel(participant: SessionParticipant): string {
+  return participant.label?.trim() || participant.identity.id;
+}
+
+function excludesParticipant(
+  participant: SessionParticipant,
+  creator: SessionCreatedActor | undefined,
+  selfUserId: string | undefined,
+): boolean {
+  return (
+    (participant.identity.type === "profile" && participant.identity.id === selfUserId) ||
+    JSON.stringify(participant.identity) === JSON.stringify(creator?.identity)
+  );
+}
+
 type SessionAgeUnit = RelativeTimeUnit | "week" | "month" | "year";
 
 type SessionHovercardAvatarAuth = {
   authTokens: readonly string[];
   authReady: boolean;
+};
+
+type SessionHovercardInput = {
+  row?: SidebarSessionHovercardRow;
+  selfUserId?: string;
+  avatarAuth?: SessionHovercardAvatarAuth;
+  personActivity?: PersonActivityRouting;
+  pullRequests?: ControlUiSessionPullRequestSnapshot;
+  progressCard?: ProgressCard | null;
 };
 
 let channelAvatarElementLoad: Promise<unknown> | undefined;
@@ -145,7 +177,7 @@ function renderHeader(row: SidebarSessionHovercardRow) {
   const updated = formatSessionAge(row.updatedAt, true);
   return html`<header class="session-hovercard__header">
     <span class="session-hovercard__heading">
-      <span class="session-hovercard__title">${row.label}</span>
+      <span class="session-hovercard__title">${renderSessionColorDot(row.color)}${row.label}</span>
       ${updated
         ? html`<span class="session-hovercard__meta"
             >${t("channels.hub.updatedAgo", { ago: updated })}</span
@@ -158,11 +190,50 @@ function renderHeader(row: SidebarSessionHovercardRow) {
   </header>`;
 }
 
-function renderSessionContext(
-  row: SidebarSessionHovercardRow | undefined,
-  selfUserId?: string,
-  avatarAuth?: SessionHovercardAvatarAuth,
+/**
+ * Keeps the locale's own "with {name}" phrasing and list separators while making each
+ * name its own link. A translation that lost its placeholder falls back to plain text
+ * rather than dropping the names.
+ */
+function renderParticipantNames(
+  participants: readonly SessionParticipant[],
+  formattedNames: string,
+  personActivity: PersonActivityRouting | undefined,
 ) {
+  const [prefix, suffix] = t("sessionsView.withParticipant").split("{name}");
+  if (suffix === undefined) {
+    return t("sessionsView.withParticipant", { name: formattedNames });
+  }
+  const links = participants.map((participant) =>
+    participant.identity.type === "profile"
+      ? personActivityLink(participant.identity.id, personActivity)
+      : null,
+  );
+  const parts = new Intl.ListFormat(i18n.getLocale(), {
+    style: "long",
+    type: "unit",
+  }).formatToParts(participants.map(participantLabel));
+  const names: (TemplateResult | string)[] = [];
+  let index = 0;
+  for (const part of parts) {
+    if (part.type === "literal") {
+      names.push(part.value);
+      continue;
+    }
+    names.push(
+      renderPersonName(part.value, links[index] ?? null, "session-hovercard__participant-name"),
+    );
+    index += 1;
+  }
+  return html`${prefix}${names}${suffix}`;
+}
+
+function renderSessionContext({
+  row,
+  selfUserId,
+  avatarAuth,
+  personActivity,
+}: SessionHovercardInput) {
   const creator = row?.createdActor;
   const creatorLabel = creator?.label?.trim() || creator?.id?.trim();
   const creatorInitials = creator ? sessionOwnerInitials(creator) : "";
@@ -172,24 +243,32 @@ function renderSessionContext(
       >`
     : nothing;
   const context = row?.workContext;
+  const placementIdentity =
+    row?.placementProviderId && row.placementProfileId
+      ? {
+          label: `${row.placementProviderId} · ${row.placementProfileId}`,
+          title: t("sessionHovercard.runsOn", {
+            providerId: row.placementProviderId,
+            profileId: row.placementProfileId,
+          }),
+        }
+      : undefined;
   const participantIds = new Set<string>();
   let excludedProjectedCount = 0;
   const participants = (row?.participants ?? []).filter((participant) => {
-    const id = participant.id?.trim();
-    if (!id || participantIds.has(id)) {
+    const id = JSON.stringify(participant.identity);
+    if (participantIds.has(id)) {
       return false;
     }
     participantIds.add(id);
-    if (id === creator?.id || id === selfUserId) {
+    if (excludesParticipant(participant, creator, selfUserId)) {
       excludedProjectedCount += 1;
       return false;
     }
     return true;
   });
   const visibleParticipants = participants.slice(0, MAX_VISIBLE_PARTICIPANTS);
-  const participantNames = visibleParticipants.map(
-    (participant) => participant.label || participant.id || "",
-  );
+  const participantNames = visibleParticipants.map(participantLabel);
   const formattedParticipantNames = new Intl.ListFormat(i18n.getLocale(), {
     style: "long",
     type: "unit",
@@ -207,46 +286,60 @@ function renderSessionContext(
   ]
     .filter(Boolean)
     .join(" ");
-  if (!creatorLabel && !context && visibleParticipants.length === 0) {
+  if (
+    !creatorLabel &&
+    !context &&
+    !placementIdentity &&
+    visibleParticipants.length === 0 &&
+    row?.boardFace !== "dashboard" &&
+    row?.hasAutomation !== true
+  ) {
     return nothing;
   }
   if (row?.channelAvatarUrl) {
     ensureChannelAvatarElement();
   }
+  const creatorId = creator?.id;
+  const creatorActivity =
+    creator?.identity?.type === "profile"
+      ? personActivityLink(creator.identity.id, personActivity)
+      : null;
+  const creatorAvatar = row?.channelAvatarUrl
+    ? html`<openclaw-channel-avatar
+        class="session-hovercard__creator-avatar"
+        .routeUrl=${row.channelAvatarUrl}
+        .authTokens=${avatarAuth?.authTokens ?? []}
+        .authReady=${avatarAuth?.authReady ?? false}
+        .fallback=${avatarFallback}
+        aria-hidden="true"
+      ></openclaw-channel-avatar>`
+    : creatorId
+      ? html`<openclaw-viewer-avatar
+          class="session-hovercard__creator-avatar"
+          .user=${{
+            id: creatorId,
+            name: creator?.label,
+            avatarUrl: creator?.avatarUrl,
+            watchedSessions: [],
+          }}
+          .markAsViewer=${false}
+          .identity=${creator?.identity}
+          variant="session"
+          aria-hidden="true"
+        ></openclaw-viewer-avatar>`
+      : html`<span class="session-hovercard__context-icon" aria-hidden="true"
+          >${icons.users}</span
+        >`;
   return html`<div class="session-hovercard__context">
     ${creatorLabel || visibleParticipants.length > 0
       ? html`<div
           class="session-hovercard__context-row session-hovercard__identity-row"
           aria-label=${[creatorLabel, participantSummary].filter(Boolean).join(", ")}
         >
-          ${row?.channelAvatarUrl
-            ? html`<openclaw-channel-avatar
-                class="session-hovercard__creator-avatar"
-                .routeUrl=${row.channelAvatarUrl}
-                .authTokens=${avatarAuth?.authTokens ?? []}
-                .authReady=${avatarAuth?.authReady ?? false}
-                .fallback=${avatarFallback}
-                aria-hidden="true"
-              ></openclaw-channel-avatar>`
-            : creator?.id
-              ? html`<openclaw-viewer-avatar
-                  class="session-hovercard__creator-avatar"
-                  .user=${{
-                    id: creator.id,
-                    name: creator.label,
-                    avatarUrl: creator.avatarUrl,
-                    watchedSessions: [],
-                  }}
-                  .markAsViewer=${false}
-                  variant="session"
-                  aria-hidden="true"
-                ></openclaw-viewer-avatar>`
-              : html`<span class="session-hovercard__context-icon" aria-hidden="true"
-                  >${icons.users}</span
-                >`}
+          ${renderPersonAvatarLink(creatorAvatar, creatorActivity)}
           <span class="session-hovercard__identity-copy">
             ${creatorLabel
-              ? html`<span class="session-hovercard__identity-name">${creatorLabel}</span>`
+              ? renderPersonName(creatorLabel, creatorActivity, "session-hovercard__identity-name")
               : nothing}
             ${creatorLabel && visibleParticipants.length > 0
               ? html`<span class="session-hovercard__identity-separator" aria-hidden="true"
@@ -256,9 +349,11 @@ function renderSessionContext(
             ${visibleParticipants.length > 0
               ? html`<span class="session-hovercard__participants">
                   <span class="session-hovercard__participant"
-                    >${t("sessionsView.withParticipant", {
-                      name: formattedParticipantNames,
-                    })}</span
+                    >${renderParticipantNames(
+                      visibleParticipants,
+                      formattedParticipantNames,
+                      personActivity,
+                    )}</span
                   >
                   ${hiddenParticipantCount > 0
                     ? html`<span class="session-hovercard__participants-more"
@@ -310,13 +405,66 @@ function renderSessionContext(
               </div>`
             : nothing}`
       : nothing}
+    ${placementIdentity
+      ? html`<div
+          class="session-hovercard__context-row"
+          aria-label=${placementIdentity.title}
+          title=${placementIdentity.title}
+        >
+          <span class="session-hovercard__context-icon" aria-hidden="true">${icons.server}</span>
+          <span class="session-hovercard__context-value session-hovercard__context-text"
+            >${placementIdentity.label}</span
+          >
+        </div>`
+      : nothing}
+    ${row?.boardFace === "dashboard"
+      ? html`<div
+          class="session-hovercard__context-row"
+          aria-label=${t("sessionsView.opensAsDashboard")}
+        >
+          <span class="session-hovercard__context-icon" aria-hidden="true"
+            >${icons.layoutDashboard}</span
+          >
+          <span class="session-hovercard__context-value session-hovercard__context-text"
+            >${t("sessionsView.opensAsDashboard")}</span
+          >
+        </div>`
+      : nothing}
+    ${row?.hasAutomation === true
+      ? html`<div
+          class="session-hovercard__context-row"
+          aria-label=${t("sessionsView.automationAttached")}
+        >
+          <span class="session-hovercard__context-icon" aria-hidden="true">${icons.clock}</span>
+          <span class="session-hovercard__context-value session-hovercard__context-text"
+            >${t("sessionsView.automationAttached")}</span
+          >
+        </div>`
+      : nothing}
   </div>`;
+}
+
+function renderPullRequestAuthor(author: ControlUiSessionPullRequest["author"]) {
+  // Each row is its own grid, so the cell is always emitted: dropping it would
+  // move the diff stats out of the trailing 1fr column and break the flush-right
+  // alignment that authored and authorless rows must share.
+  if (!author) {
+    return html`<span class="session-hovercard__pr-author"></span>`;
+  }
+  return html`<span
+    class="session-hovercard__pr-author"
+    title=${t("sessionHovercard.pullRequestAuthorLabel", { login: author.login })}
+    >${author.login}</span
+  >`;
 }
 
 function renderPullRequestRow(pullRequest: ControlUiSessionPullRequest) {
   const state = pullRequestStateLabel(pullRequest.state);
   const checks = pullRequest.checks ? checksLabel(pullRequest.checks) : null;
   const details = [
+    pullRequest.author
+      ? t("sessionHovercard.pullRequestAuthorLabel", { login: pullRequest.author.login })
+      : null,
     checks,
     pullRequest.changedFiles === undefined ? null : changedFilesLabel(pullRequest.changedFiles),
     pullRequest.additions === undefined ? null : `+${pullRequest.additions.toLocaleString()}`,
@@ -342,7 +490,7 @@ function renderPullRequestRow(pullRequest: ControlUiSessionPullRequest) {
       >${pullRequestStateIcon(pullRequest.state)}</span
     >
     <span class="session-hovercard__pr-number">#${pullRequest.number}</span>
-    ${renderDiffStats(pullRequest)}
+    ${renderPullRequestAuthor(pullRequest.author)}${renderDiffStats(pullRequest)}
   </a>`;
 }
 
@@ -366,7 +514,6 @@ function renderPullRequestDetails(snapshot: ControlUiSessionPullRequestSnapshot 
   if (!branch) {
     return nothing;
   }
-  const noPullRequest = t("sessionHovercard.noPrYet");
   const createPullRequest = t("chat.pullRequests.createPr");
   return html`
     <div class="session-hovercard__branch-row">
@@ -376,35 +523,30 @@ function renderPullRequestDetails(snapshot: ControlUiSessionPullRequestSnapshot 
       >
       ${renderDiffStats(branch)}
     </div>
-    <div class="session-hovercard__no-pr">
-      ${branch.createUrl
-        ? html`<a href=${branch.createUrl} target="_blank" rel="noopener noreferrer"
+    ${branch.createUrl
+      ? html`<div class="session-hovercard__no-pr">
+          <a href=${branch.createUrl} target="_blank" rel="noopener noreferrer"
             >${createPullRequest}</a
-          >`
-        : noPullRequest}
-    </div>
+          >
+        </div>`
+      : nothing}
   `;
 }
 
-export function renderSessionHovercard(input: {
-  row?: SidebarSessionHovercardRow;
-  selfUserId?: string;
-  avatarAuth?: SessionHovercardAvatarAuth;
-  pullRequests?: ControlUiSessionPullRequestSnapshot;
-  progressCard?: ProgressCard | null;
-}) {
+export function renderSessionHovercard(input: SessionHovercardInput) {
   const hasPullRequestDetails = Boolean(
     input.pullRequests && (input.pullRequests.pullRequests.length > 0 || input.pullRequests.branch),
   );
-  const creatorId = input.row?.createdActor?.id;
   const hasOtherParticipant = input.row?.participants?.some((participant) => {
-    const id = participant.id?.trim();
-    return Boolean(id && id !== creatorId && id !== input.selfUserId);
+    return !excludesParticipant(participant, input.row?.createdActor, input.selfUserId);
   });
   const hasContext = Boolean(
     input.row?.channelAvatarUrl ||
     input.row?.createdActor ||
     input.row?.workContext ||
+    (input.row?.placementProviderId && input.row.placementProfileId) ||
+    input.row?.boardFace === "dashboard" ||
+    input.row?.hasAutomation === true ||
     hasOtherParticipant,
   );
   const lastMessagePreview = input.progressCard
@@ -421,7 +563,7 @@ export function renderSessionHovercard(input: {
       : nothing}
     ${hasContext
       ? html`<section class="session-hovercard__section session-hovercard__section--metadata">
-          ${renderSessionContext(input.row, input.selfUserId, input.avatarAuth)}
+          ${renderSessionContext(input)}
         </section>`
       : nothing}
     ${hasPullRequestDetails
@@ -436,7 +578,14 @@ export function renderSessionHovercard(input: {
       : nothing}
     ${input.progressCard
       ? html`<footer class="session-hovercard__section session-hovercard__progress-footer">
-          ${renderSessionProgressCard(input.progressCard, "hovercard")}
+          ${renderSessionProgressCard(
+            input.progressCard,
+            "hovercard",
+            undefined,
+            input.row?.status,
+            input.row?.startedAt,
+            input.row?.endedAt,
+          )}
         </footer>`
       : nothing}
   </div>`;

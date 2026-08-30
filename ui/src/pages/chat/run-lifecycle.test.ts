@@ -4,19 +4,21 @@ import { describe, expect, it, vi } from "vitest";
 import type { GatewayBrowserClient } from "../../api/gateway.ts";
 import type { SessionsListResult } from "../../api/types.ts";
 import { isSessionRunActive } from "../../lib/session-run-state.ts";
+import { createTestGatewayClient } from "../../test-helpers/gateway-client.ts";
 import { sessionMutationGatewayHello } from "../../test-helpers/gateway-methods.ts";
 import {
-  CHAT_RUN_STATUS_TOAST_DURATION_MS,
   handleAbortChat,
   hasAbortableSessionRun,
   hasDirectSessionRun,
   reconcileChatRunFromCurrentSessionRow,
   reconcileChatRunFromSessionRow,
   reconcileChatRunLifecycle,
-  reconcileStaleChatRunAfterSessionStatePublication,
+  reconcileChatRunAfterSessionStatePublication,
   replayPendingChatAbort,
 } from "./run-lifecycle.ts";
 import { buildToolStreamIdentity } from "./tool-stream-identity.ts";
+
+const CHAT_RUN_STATUS_TOAST_DURATION_MS = 5_000;
 
 type ReconcileHost = Parameters<typeof reconcileChatRunFromCurrentSessionRow>[0];
 type TestRow = {
@@ -25,6 +27,7 @@ type TestRow = {
   hasActiveSubagentRun?: boolean;
   activeRunIds?: string[];
   status?: string;
+  lastRunId?: string;
   startedAt?: number;
 };
 
@@ -90,6 +93,23 @@ describe("handleAbortChat", () => {
       key: "agent:main",
       clearQueued: true,
     });
+  });
+
+  it("routes recovered embedded Stop through sessions.abort with its run id", async () => {
+    const request = vi.fn(async () => ({ status: "aborted" }));
+    const host = makeAbortHost({
+      client: createTestGatewayClient(request),
+      chatRunId: "run-embedded-recovered",
+      chatRunSessionAbortable: true,
+    });
+
+    await handleAbortChat(host);
+
+    expect(request).toHaveBeenCalledWith("sessions.abort", {
+      key: "agent:main",
+      runId: "run-embedded-recovered",
+    });
+    expect(request).not.toHaveBeenCalledWith("chat.abort", expect.anything());
   });
 
   it("shows reconnect guidance when an offline session run has no browser run identity", async () => {
@@ -701,7 +721,6 @@ describe("reconcileChatRunFromCurrentSessionRow stale-active suppression (#87875
       ]),
       sessions: {
         reconcileRunTerminal,
-        setModelOverride: vi.fn(),
       },
     });
 
@@ -736,7 +755,6 @@ describe("reconcileChatRunFromCurrentSessionRow stale-active suppression (#87875
       sessionsResult: null,
       sessions: {
         reconcileRunTerminal,
-        setModelOverride: vi.fn(),
       },
     });
 
@@ -850,9 +868,40 @@ describe("reconcileChatRunFromCurrentSessionRow stale-active suppression (#87875
       lastLocalTerminalReconcile: makeLocalTerminalReconcile(),
     });
 
-    expect(reconcileStaleChatRunAfterSessionStatePublication(host)).toBe(true);
+    expect(reconcileChatRunAfterSessionStatePublication(host)).toBe(true);
     expect(rowActive(host)).toBe(false);
   });
+
+  it("recovers a missed terminal event from the exact settled session row", () => {
+    const host = makeHost({
+      chatRunId: "r1",
+      chatStream: "complete reply",
+      sessionsResult: makeSessionsResult([
+        { key: "s1", hasActiveRun: false, lastRunId: "r1", status: "done" },
+      ]),
+    });
+
+    expect(reconcileChatRunAfterSessionStatePublication(host)).toBe(true);
+    expect(host.chatRunId).toBeNull();
+    expect(host.chatStream).toBeNull();
+  });
+
+  it.each([undefined, "older-run"])(
+    "does not settle a live run from a %s terminal row identity",
+    (lastRunId) => {
+      const host = makeHost({
+        chatRunId: "r1",
+        chatStream: "still running",
+        sessionsResult: makeSessionsResult([
+          { key: "s1", hasActiveRun: false, lastRunId, status: "done" },
+        ]),
+      });
+
+      expect(reconcileChatRunAfterSessionStatePublication(host)).toBe(false);
+      expect(host.chatRunId).toBe("r1");
+      expect(host.chatStream).toBe("still running");
+    },
+  );
 
   it("keeps suppressing repeated stale active refreshes for the completed run", () => {
     const host = makeHost({

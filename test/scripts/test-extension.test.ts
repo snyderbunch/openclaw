@@ -17,7 +17,6 @@ import {
   createExtensionTestProcessTargetChunks,
   createExtensionTestShards,
   listExtensionTestFilesForRoots,
-  listTrackedTestFilesForRoots,
   resolveExtensionBatchPlan,
   resolveExtensionTestConfig,
   resolveExtensionTestPlan,
@@ -94,7 +93,7 @@ function findExtensionWithoutTests() {
 }
 
 function listExtensionTestFiles(extensionId: string): string[] {
-  return listTrackedTestFilesForRoots([bundledPluginRoot(extensionId)]);
+  return listExtensionTestFilesForRoots([bundledPluginRoot(extensionId)]);
 }
 
 function expectedMatrixTestProcessCount() {
@@ -608,8 +607,8 @@ describe("scripts/test-extension.mts", () => {
         OPENCLAW_EXTENSION_BATCH_PARALLEL: "2",
         OPENCLAW_VITEST_FS_MODULE_CACHE_PATH: path.join(
           process.cwd(),
-          "node_modules",
-          ".experimental-vitest-cache",
+          ".cache",
+          "vitest",
           "extension-batch",
           "0-heavy",
         ),
