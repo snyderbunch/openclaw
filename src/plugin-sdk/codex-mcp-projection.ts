@@ -1,12 +1,12 @@
-// Private helper surface for the bundled Codex plugin. Mirrors the Codex CLI
-// runtime's user-mcp-server projection so the bundled Codex app-server harness
-// can attach the same user `mcp.servers` entries to its thread config without
-// deep-importing core helpers.
+// Private thread-configuration projections for the bundled Codex plugin.
+// Workspace preparation and MCP metadata remain separate from live run resources.
 import { pinExecToolTarget } from "../agents/exec-tool-target-pinning.js";
 import type { AgentHarnessHostCapabilities } from "../agents/harness/host-capability-types.js";
 import {
   resolveAgentHarnessScheduledToolProjectionCapability,
+  resolveAgentHarnessTtsProvenanceTransferCapability,
   type AgentHarnessScheduledToolProjectionFactory,
+  type AgentHarnessTtsProvenanceTransfer,
 } from "../agents/harness/host-private-capabilities.js";
 import type { AnyAgentTool } from "../agents/tools/common.js";
 import type {
@@ -16,7 +16,9 @@ import type {
 import { getPluginToolMeta } from "../plugins/tool-metadata.js";
 
 export { pinExecToolTarget };
+export { resolveBootstrapFilesForPreparation } from "../agents/bootstrap-files.js";
 export type CodexScheduledToolProjectionFactory = AgentHarnessScheduledToolProjectionFactory;
+export type CodexTtsProvenanceTransfer = AgentHarnessTtsProvenanceTransfer;
 
 /** Resolve the private scheduled-tool projection issuer for the Codex harness owner. */
 export function resolveCodexScheduledToolProjectionFactory(
@@ -28,9 +30,20 @@ export function resolveCodexScheduledToolProjectionFactory(
   });
 }
 
+/** Resolve private TTS delivery transfer for the bundled Codex harness owner. */
+export function resolveCodexTtsProvenanceTransfer(
+  hostCapabilities: AgentHarnessHostCapabilities,
+): CodexTtsProvenanceTransfer | undefined {
+  return resolveAgentHarnessTtsProvenanceTransferCapability({
+    hostCapabilities,
+    ownerPluginId: "codex",
+  });
+}
+
 export {
   buildCodexUserMcpServersThreadConfigPatch,
   buildCodexUserMcpServersThreadConfigPatchForRuntime,
+  buildCodexUserMcpServersThreadConfigPatchForRun,
   resolveCodexMcpToolOverridesForAgent,
 } from "../agents/cli-runner/bundle-mcp-codex.js";
 export {
