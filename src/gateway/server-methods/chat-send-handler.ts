@@ -9,6 +9,7 @@ import {
   type SessionGoalOperation,
   type SessionGoalOperationResult,
 } from "../../config/sessions/goals-operations.js";
+import type { PrepareAssistantTranscriptMessage } from "../../config/sessions/transcript-assistant-delivery.js";
 import { getAgentEventLifecycleGeneration } from "../../infra/agent-events.js";
 import { clearAgentRunContext } from "../../infra/agent-run-registry.js";
 import { emitDiagnosticsTimelineEvent } from "../../infra/diagnostics-timeline.js";
@@ -25,6 +26,10 @@ import { authorizeGatewaySessionCreation, resolveCreatorSandbox } from "../opera
 import type { ChatRunTiming } from "../server-chat-state.js";
 import { SessionMutationAuthorizationChangedError } from "../session-sharing.js";
 import { loadSessionEntry } from "../session-utils.js";
+import {
+  prepareGatewaySkillAuthoring,
+  invalidateSkillAuthoringForOtherRequester,
+} from "../skill-library-authoring.js";
 import {
   terminalizeRestartSafeChatAdmission,
   type RestartSafeChatTerminalState,
@@ -54,7 +59,8 @@ import type { GatewayRequestHandlerOptions } from "./types.js";
 type ChatSendInternalOptions = {
   goalResume?: SessionGoalOperation & { action: "resume" };
   trustedSystemInput?: boolean;
-  display?: false;
+  transcript?: Parameters<typeof createGatewayChatUserTurnController>[0]["transcript"];
+  prepareAssistantTranscriptMessage?: PrepareAssistantTranscriptMessage;
   toolsAllow?: string[];
   skillWorkshopProposalRevision?: SkillWorkshopProposalRevisionConstraint;
 };
@@ -173,15 +179,17 @@ async function handleChatSendWithOptions(
       client,
       request: normalizedRequest.value,
       session: preparedSession.value,
-      display: options?.display,
+      transcript: options?.transcript,
       startedAt: admissionStartedAt,
       warn: (message) => context.logGateway.warn(message),
+      mentionInbox: context.mentionInbox,
       assertGoalCurrent: () => {
         sessionMutationCommitGuard?.();
         sessionMutationAuthorization?.assertCurrent();
         const currentConfig = context.getRuntimeConfig();
         const initialEntry = admitted.value.initialSessionEntry;
         if (initialEntry) {
+          admitted.value.assertInitialSkillSelection?.();
           // Missing targets have no sharing owner yet; revalidate their creator before SQL commit.
           const currentTarget = loadSessionEntry(
             preparedSession.value.sessionLoadKey,
@@ -221,15 +229,6 @@ async function handleChatSendWithOptions(
       replyContextFieldsPromise,
     } = userTurn;
     preparedMediaRecorder = userTurnRecorder;
-    admitted.value.setPendingInputCleanup(() => {
-      userTurnRecorder.finishPendingInput?.(
-        activeRunAbort.controller.signal.aborted &&
-          activeRunAbort.entry?.abortStopReason !== "restart" &&
-          !isAgentRunRestartAbortReason(activeRunAbort.controller.signal.reason)
-          ? "cancelled"
-          : "interrupted",
-      );
-    });
     const preparedUserTurn = prepareChatSendUserTurn({
       request: normalizedRequest.value,
       session: preparedSession.value,
@@ -237,9 +236,27 @@ async function handleChatSendWithOptions(
       attachments: preparedAttachments.value,
       client,
       logGateway: context.logGateway,
+      getConfig: context.getRuntimeConfig,
       userTurn,
     });
     const { ctx, isInternalTextSlashCommandTurn } = preparedUserTurn;
+    admitted.value.setPendingInputCleanup(() => {
+      try {
+        userTurnRecorder.finishPendingInput?.(
+          activeRunAbort.controller.signal.aborted &&
+            activeRunAbort.entry?.abortStopReason !== "restart" &&
+            !isAgentRunRestartAbortReason(activeRunAbort.controller.signal.reason)
+            ? "cancelled"
+            : "interrupted",
+        );
+      } finally {
+        void preparedUserTurn
+          .discardUnreferencedMedia(userTurnRecorder.getPendingInputMessage?.())
+          .catch((error: unknown) =>
+            context.logGateway.warn(`Failed to discard unused chat media: ${String(error)}`),
+          );
+      }
+    });
     if (
       entry?.sessionId &&
       isOperatorUiClient(clientInfo) &&
@@ -367,6 +384,12 @@ async function handleChatSendWithOptions(
       }
     }
 
+    if (messageInjectionTarget) {
+      invalidateSkillAuthoringForOtherRequester(
+        sessionKey,
+        client?.internal?.syntheticClient ? undefined : client?.authenticatedUserProfile?.profileId,
+      );
+    }
     const beginCapturedMessageInjection = createChatSendMessageInjectionStarter({
       target: messageInjectionTarget,
       request: normalizedRequest.value,
@@ -402,6 +425,23 @@ async function handleChatSendWithOptions(
       return;
     }
     messageInjectionAttempt = preAckInjection.attempt;
+    // The admitted turn owns authoring after creating a session; the request's
+    // absent-target authorization expires when that session is materialized.
+    const skillLibraryAuthoring = prepareGatewaySkillAuthoring(
+      {
+        client,
+        context,
+        sessionMutationCommitGuard: () => {
+          sessionMutationCommitGuard?.();
+          admitted.value.assertWorkAdmissionCurrent();
+        },
+      },
+      sessionKey,
+      !options &&
+        !systemInputProvenance &&
+        !reconnectResumeRequested &&
+        normalizedRequest.value.turnKind === "main",
+    );
     const serverTiming = shouldIncludeChatSendAckServerTiming(clientInfo)
       ? {
           receivedToAckMs: roundedChatSendTimingMs(performance.now() - chatSendReceivedAtMs),
@@ -460,7 +500,9 @@ async function handleChatSendWithOptions(
       client,
       context,
       toolsAllow: options?.toolsAllow,
+      prepareAssistantTranscriptMessage: options?.prepareAssistantTranscriptMessage,
       skillWorkshopProposalRevision: options?.skillWorkshopProposalRevision,
+      skillLibraryAuthoring,
       cronCreatorAuthority,
       externalAuthorityAdmission,
       injection: {
@@ -525,7 +567,10 @@ export async function handleChatSendWithSkillWorkshopProposalRevision(
 export async function handleTrustedInternalChatSend(
   options: GatewayRequestHandlerOptions,
   onAdmissionOwned?: () => Promise<boolean>,
-  inputOptions?: Pick<ChatSendInternalOptions, "display" | "toolsAllow">,
+  inputOptions?: Pick<
+    ChatSendInternalOptions,
+    "transcript" | "toolsAllow" | "prepareAssistantTranscriptMessage"
+  >,
 ): Promise<void> {
   await handleChatSendWithOptions(options, onAdmissionOwned, undefined, {
     ...inputOptions,

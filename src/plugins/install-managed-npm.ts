@@ -34,10 +34,9 @@ import {
   listManagedNpmRootPackageNames,
   listNewManagedNpmRootPackageDirs,
   quarantineManagedNpmProjectRebuildArtifacts,
-  resolveManagedNpmGenerationUseForInstall,
-  resolveManagedNpmInstallRoot,
+  removeEmptyDirectoryIfPresent,
+  resolveManagedNpmInstallPlan,
   resolveManagedNpmRootDependencySpecForInstall,
-  resolveManagedNpmRootPackageDir,
   resolveRequiredPlatformPackageNames,
   rollbackManagedNpmPluginInstall,
   rollbackManagedNpmRootPreparedDependency,
@@ -58,13 +57,12 @@ import {
   formatUnresolvedOpenClawPeerLinkError,
   loadPluginInstallRuntime,
   readOptionalPackageManifest,
-  resolveEffectiveInstallMode,
   runInstallSourceScan,
   sourceFamilyForInstallPolicySource,
 } from "./install-shared.js";
 import {
   attachPluginInstallTransaction,
-  isPluginInstallCommitDeferred,
+  resolvePluginInstallTransactionRequest,
 } from "./install-transaction.js";
 import type {
   InstallPluginResult,
@@ -72,7 +70,7 @@ import type {
   PluginInstallLogger,
   PluginInstallPolicyRequest,
 } from "./install-types.js";
-import { hasRetainedManagedNpmInstallMarker } from "./managed-npm-retention.js";
+import { isOfficialCatalogLookupPluginIdReplacement } from "./official-external-install-records.js";
 import {
   auditDeclaredOpenClawHostDependency,
   relinkOpenClawPeerDependenciesInManagedNpmRoot,
@@ -109,34 +107,13 @@ export async function installPluginFromManagedNpmRoot(
   );
   const expectedPluginId = params.expectedPluginId;
   const npmBaseDir = params.npmDir ? resolveUserPath(params.npmDir) : resolveDefaultPluginNpmDir();
-  const generationUse = await resolveManagedNpmGenerationUseForInstall({
+  const { npmRoot, installRoot, targetMode, policyMode } = await resolveManagedNpmInstallPlan({
     runtime,
     npmBaseDir,
     packageName: params.packageName,
     requestedMode: mode,
     npmResolution: params.npmResolution,
   });
-  const npmRoot = resolveManagedNpmInstallRoot({
-    npmBaseDir,
-    packageName: params.packageName,
-    npmResolution: params.npmResolution,
-    useGeneration: generationUse !== "none",
-  });
-  const installRoot = resolveManagedNpmRootPackageDir(npmRoot, params.packageName);
-  const targetMode =
-    generationUse === "retained-install" && hasRetainedManagedNpmInstallMarker(installRoot)
-      ? "update"
-      : await resolveEffectiveInstallMode({
-          runtime,
-          requestedMode: mode,
-          targetPath: installRoot,
-        });
-  const policyMode =
-    generationUse === "update"
-      ? "update"
-      : generationUse === "retained-install"
-        ? "install"
-        : targetMode;
   const availability = await ensureInstallTargetAvailableForMode({
     runtime,
     targetPath: installRoot,
@@ -548,7 +525,11 @@ export async function installPluginFromManagedNpmRoot(
       if (
         manifestResult.ok &&
         manifestResult.manifest.id === params.expectedReplacementPluginId &&
-        manifestResult.manifest.legacyPluginIds?.includes(expectedPluginId)
+        (manifestResult.manifest.legacyPluginIds?.includes(expectedPluginId) ||
+          isOfficialCatalogLookupPluginIdReplacement({
+            expectedPluginId,
+            expectedReplacementPluginId: params.expectedReplacementPluginId,
+          }))
       ) {
         // Only managed npm updates may replace an expected id, after the downloaded
         // official manifest corroborates the catalog-declared migration.
@@ -621,6 +602,10 @@ export async function installPluginFromManagedNpmRoot(
       logger,
     });
     await cleanupManagedNpmPluginInstallRollbackSnapshot({ snapshot: rollbackSnapshot, logger });
+    // Prepared npm-pack archives must be gone before retiring an empty failed project.
+    await removeEmptyDirectoryIfPresent(npmRoot).catch((error: unknown) =>
+      logger.warn?.(`Failed to remove empty managed npm project ${npmRoot}: ${String(error)}`),
+    );
   };
 
   try {
@@ -636,7 +621,7 @@ export async function installPluginFromManagedNpmRoot(
     preparedDependency = dependencyResult;
     const result = await runManagedNpmInstall(preparedDependency);
     installSucceeded = result.ok;
-    if (!result.ok || !isPluginInstallCommitDeferred(params)) {
+    if (!result.ok || !resolvePluginInstallTransactionRequest(params)) {
       return result;
     }
     deferredTransaction = true;

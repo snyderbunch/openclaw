@@ -1593,6 +1593,7 @@ describe("applyMediaUnderstanding", () => {
       outcome: "no-attachment",
       attachments: [],
       attachmentDispositions: {},
+      attachmentProcessing: {},
     });
   });
 
@@ -2107,6 +2108,23 @@ describe("applyMediaUnderstanding", () => {
     expect(ctx.Body).toContain("hello from utf16 text");
   });
 
+  it("extracts untyped UTF-8 attachments across the sniff boundary", async () => {
+    const text = "验证".repeat(700);
+    const mediaPath = await createTempMediaFile({
+      fileName: "notes.bin",
+      content: text,
+    });
+
+    const { ctx } = await applyWithDisabledMedia({
+      body: "<media:file>",
+      mediaPath,
+      selfServeLocalPaths: false,
+    });
+
+    expect(ctx.agentText).toContain(text);
+    expect(ctx.Body).toContain('<file name="notes.bin" mime="text/plain">');
+  });
+
   it("extracts inbound files above the 5MB OpenResponses default up to the managed-media cap", async () => {
     // #90096: inbound extraction sizes to the agent media cap (default 20MB),
     // not the OpenResponses input_file default (5MB). A ~6MB managed document
@@ -2146,6 +2164,26 @@ describe("applyMediaUnderstanding", () => {
     });
 
     expectPolicyRejectedFileApplied({ ctx, result, mime: "application/pdf" });
+  });
+
+  it("keeps cached attachment bytes intact when a PDF extractor mutates its input", async () => {
+    const original = Buffer.from("%PDF-1.7\nfixture");
+    const mediaPath = await createTempMediaFile({ fileName: "mutable.pdf", content: original });
+    const { MediaAttachmentCache } = await import("./attachments.cache.js");
+    const pdf = await import("../media/pdf-extract.js");
+    const getBuffer = vi.spyOn(MediaAttachmentCache.prototype, "getBuffer");
+    const extract = vi.spyOn(pdf, "extractPdfContent").mockImplementation(async ({ buffer }) => {
+      buffer.fill(0);
+      return { text: "extracted PDF", images: [] };
+    });
+    try {
+      const { ctx } = await applyWithDisabledMedia({ body: "<media:file>", mediaPath });
+      expect(ctx.Body).toContain("extracted PDF");
+      expect((await getBuffer.mock.results[0]?.value)?.buffer).toEqual(original);
+    } finally {
+      extract.mockRestore();
+      getBuffer.mockRestore();
+    }
   });
 
   it("respects configured allowedMimes for text-like attachments", async () => {
@@ -2245,26 +2283,6 @@ describe("applyMediaUnderstanding", () => {
       expectUnsupportedFileApplied({ ctx, result });
     },
   );
-
-  it("handles path traversal attempts in filenames safely", async () => {
-    // Even if a file somehow got a path-like name, it should be handled safely
-    const filePath = await createTempMediaFile({
-      fileName: "normal.txt",
-      content: "legitimate content",
-    });
-
-    const { ctx, result } = await applyWithDisabledMedia({
-      body: "<media:document>",
-      mediaPath: filePath,
-      mediaType: "text/plain",
-    });
-
-    expect(result.appliedFile).toBe(true);
-    // Verify the file was processed and output contains expected structure
-    expect(ctx.Body).toContain('<file name="');
-    expect(ctx.Body).toContain('mime="text/plain"');
-    expect(ctx.Body).toContain("legitimate content");
-  });
 
   it.each([
     { content: "file content", expected: "file content" },

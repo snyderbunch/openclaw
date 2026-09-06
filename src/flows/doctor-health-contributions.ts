@@ -4,6 +4,10 @@ import fs from "node:fs";
 import { isDeepStrictEqual } from "node:util";
 import { shouldManageGatewayService } from "../commands/doctor-service-repair-policy.js";
 import { emitDoctorNotes } from "../commands/doctor/emit-notes.js";
+import {
+  DoctorStateMigrationRefusalError,
+  throwIfDoctorStateMigrationRefused,
+} from "../infra/state-migrations.messages.js";
 import { scrubDoctorErrorMessage } from "./doctor-error-message.js";
 import { hasActiveGatewayExecCredential } from "./doctor-gateway-exec-credential.js";
 import {
@@ -18,7 +22,6 @@ import {
   resolveDoctorMode,
   resolveDoctorWorkspaceDir,
 } from "./doctor-health-contribution-utils.js";
-import { createDoctorHealthContribution } from "./doctor-health-contribution.js";
 import { resolveFinalDoctorHealthContributions } from "./doctor-health-contributions-final.js";
 import { resolveInitialDoctorHealthContributions } from "./doctor-health-contributions-initial.js";
 import { normalizeHealthCheck } from "./health-check-adapter.js";
@@ -560,10 +563,17 @@ async function runDoctorHealthContributionList(
   contributions: readonly DoctorHealthContribution[],
 ): Promise<void> {
   const runWithPluginMetadataSnapshot = ctx.runWithPluginMetadataSnapshot;
+  throwIfDoctorStateMigrationRefused(ctx.configResult.stateMigrationStepReceipts);
   for (const contribution of contributions) {
     try {
       const run = async () => {
-        await contribution.run(ctx);
+        try {
+          await contribution.run(ctx);
+        } finally {
+          // Deferred session writers settle here. An optional diagnostic cannot
+          // turn their recorded refusal into permission for later repairs.
+          throwIfDoctorStateMigrationRefused(ctx.configResult.stateMigrationStepReceipts);
+        }
         if (ctx.configWriteRefusal) {
           await reportDeferredLegacyState(ctx);
         }
@@ -580,7 +590,9 @@ async function runDoctorHealthContributionList(
         return;
       }
     } catch (error) {
-      await (contribution.required ? Promise.reject(error as Error) : Promise.resolve());
+      if (contribution.required || error instanceof DoctorStateMigrationRefusalError) {
+        throw error;
+      }
       const { note } = await loadNoteModule();
       note(`${contribution.id} run failed: ${scrubDoctorErrorMessage(error)}`, "Doctor warnings");
     }
@@ -595,7 +607,6 @@ if (process.env.VITEST || process.env.NODE_ENV === "test") {
   (globalThis as Record<PropertyKey, unknown>)[
     Symbol.for("openclaw.doctorHealthContributionsTestApi")
   ] = {
-    createDoctorHealthContribution,
     resolveDoctorHealthContributions,
     runDoctorHealthContributionList,
   };
