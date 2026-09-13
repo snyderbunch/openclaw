@@ -5,6 +5,7 @@ import { isMainThread, threadId } from "node:worker_threads";
 import { openNodeSqliteDatabase } from "../infra/node-sqlite.js";
 import { isPathInside } from "../infra/path-guards.js";
 import { setSqliteBusyTimeout } from "../infra/sqlite-busy-timeout.js";
+import type { SqliteIntegrityDiagnostics } from "../infra/sqlite-integrity.js";
 import { createSqliteTerminalOpenLatch } from "../infra/sqlite-terminal-open-latch.js";
 import { registerSqliteCacheExitClose } from "../infra/sqlite-wal.js";
 import { createSubsystemLogger } from "../logging/subsystem.js";
@@ -20,11 +21,12 @@ import {
   assertSupportedAgentSchemaVersion,
   readExistingAgentSchemaMeta,
 } from "./openclaw-agent-db-schema-helpers.js";
+import type { OpenClawAgentDatabaseValidation } from "./openclaw-agent-db-validation-cache.js";
 import { OPENCLAW_SQLITE_BUSY_TIMEOUT_MS } from "./openclaw-state-db.js";
 
 // Target 64 cached handles (roughly three WAL FDs each). Live borrowers,
 // transactions and incognito sessions keep their handles until owner release.
-export const OPENCLAW_AGENT_DB_OPEN_HANDLE_CAP = 64;
+const OPENCLAW_AGENT_DB_OPEN_HANDLE_CAP = 64;
 const agentDbLog = createSubsystemLogger("state/agent-db");
 const OPENCLAW_AGENT_DB_SLOW_OPEN_MS = 1_000;
 // Native and transformed SDK graphs must share the complete owner lifecycle;
@@ -50,6 +52,7 @@ export type PendingAgentDatabaseOpen = {
   assertHeld?: () => void;
   operations: number;
   releaseBorrow?: () => void;
+  validation?: OpenClawAgentDatabaseValidation;
 };
 type RetainedAgentDatabaseClose = { agentId: string; path: string; close: () => void };
 const cache = resolveGlobalSingleton<AgentDatabaseLifecycle>(
@@ -61,7 +64,9 @@ const cache = resolveGlobalSingleton<AgentDatabaseLifecycle>(
     generation: 0,
     failures: new Map(),
     leases: new Map(),
-    terminal: createSqliteTerminalOpenLatch({ closeByPath: closeOpenClawAgentDatabaseByPath }),
+    terminal: createSqliteTerminalOpenLatch({
+      closeByPath: (pathname) => closeOpenClawAgentDatabaseByPath(pathname),
+    }),
     unregisterExitClose: null,
     pending: new Map(),
     activePending: new Set(),
@@ -70,7 +75,12 @@ const cache = resolveGlobalSingleton<AgentDatabaseLifecycle>(
 );
 
 /** Each physical-open generator owns these checkpoints across any integrity await. */
-export function startAgentDatabaseOpenTiming(agentId: string, pathname: string) {
+export function startAgentDatabaseOpenTiming(
+  agentId: string,
+  pathname: string,
+  admissionMode: "sync" | "async",
+  diagnostics: SqliteIntegrityDiagnostics,
+) {
   const startedAt = performance.now();
   let elapsedMs = 0;
   const phaseDurationsMs = { open: 0, validation: 0, configuration: 0, schema: 0, registration: 0 };
@@ -87,7 +97,9 @@ export function startAgentDatabaseOpenTiming(agentId: string, pathname: string) 
         pid: process.pid,
         threadId,
         isMainThread,
+        admissionMode,
         phaseDurationsMs,
+        ...diagnostics,
         thresholdMs: OPENCLAW_AGENT_DB_SLOW_OPEN_MS,
       });
     }

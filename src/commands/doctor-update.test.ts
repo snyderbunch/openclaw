@@ -52,20 +52,29 @@ describe("maybeOfferUpdateBeforeDoctor", () => {
 
   it("passes step progress to the updater and stops the spinner when the update throws", async () => {
     const stop = vi.fn();
-    const progress = {};
+    const progress = { onStepStart: vi.fn(), onStepComplete: vi.fn() };
     mocks.createUpdateProgress.mockReturnValue({ progress, stop });
     mockGitCheckout();
-    mocks.runGatewayUpdate.mockRejectedValue(new Error("update exploded"));
+    const step = { name: "fetch", command: "git fetch", index: 1, total: 1 };
+    mocks.runGatewayUpdate.mockImplementation(async ({ progress: forwarded }) => {
+      forwarded?.onStepStart?.(step);
+      forwarded?.onStepComplete?.({ ...step, durationMs: 1, exitCode: 0 });
+      throw new Error("update exploded");
+    });
 
     const confirm = vi.fn().mockResolvedValue(true);
     await expect(runOffer({ root: "/repo/link", confirm })).rejects.toThrow("update exploded");
 
     expect(mocks.runGatewayUpdate).toHaveBeenCalledWith(
       expect.objectContaining({
-        progress,
         allowGatewayServiceRepair: false,
         allowGatewayActivation: false,
       }),
+    );
+    expect(progress.onStepStart).toHaveBeenCalledWith(step, undefined);
+    expect(progress.onStepComplete).toHaveBeenCalledWith(
+      { ...step, durationMs: 1, exitCode: 0 },
+      undefined,
     );
     expect(mocks.createUpdateProgress).toHaveBeenCalledWith(true);
     expect(stop).toHaveBeenCalledTimes(1);
@@ -246,7 +255,6 @@ describe("maybeOfferUpdateBeforeDoctor", () => {
           config: {},
         }),
       );
-      expect(mocks.runUpdateInferenceProbe).toHaveBeenCalledTimes(outcome === "healthy" ? 1 : 0);
       expect(mocks.doctorCommand).not.toHaveBeenCalled();
       if (outcome === "healthy") {
         expect(runtime.exit).not.toHaveBeenCalled();
@@ -552,6 +560,7 @@ describe("maybeOfferUpdateBeforeDoctor", () => {
       if (safe) {
         expect(mocks.maybeRestartServiceAfterFailedMutableUpdate).toHaveBeenCalledWith({
           recovery: { serviceRestartSafe: true, version: "2026.4.24", buildId: "synthetic-build" },
+          updateRun: await mocks.admitUpdateCommandRun.mock.results[0]!.value,
           preManagedServiceStop: expect.objectContaining({ stopped: true }),
           jsonMode: false,
           timeoutMs: 1_200_000,

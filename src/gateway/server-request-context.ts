@@ -109,7 +109,7 @@ type GatewayRequestContextRuntime = Pick<
     > & {
       configReloader: Pick<
         GatewayCoreRuntime["runtimeState"]["configReloader"],
-        "isConfigReloadSettled"
+        "isConfigReloadSettled" | "getDeferredChannelReloads"
       >;
     };
     lifecycle: Pick<GatewayCoreRuntime["lifecycle"], "closePreludeStarted">;
@@ -135,7 +135,7 @@ type GatewayRequestContextRuntime = Pick<
     readinessEventLoopHealth: Pick<GatewayCoreRuntime["readinessEventLoopHealth"], "snapshot">;
     kernel: Pick<
       GatewayCoreRuntime["kernel"],
-      "notifyPluginMetadataChanged" | "getConfigReloaderHotReloadStatus"
+      "applyPluginLifecycleChange" | "getConfigReloaderHotReloadStatus"
     >;
     workerEnvironmentStartup:
       | Pick<NonNullable<GatewayCoreRuntime["workerEnvironmentStartup"]>, "placementStore">
@@ -144,6 +144,7 @@ type GatewayRequestContextRuntime = Pick<
       | {
           diskSpace: GatewayRequestContext["workerPlacementDiskSpaceReader"];
           runnerAvailability: GatewayRequestContext["workerPlacementRunnerAvailabilityReader"];
+          repositoryWorkspaceMutationService: GatewayRequestContext["workerRepositoryWorkspaceMutationService"];
         }
       | undefined;
   };
@@ -222,6 +223,8 @@ export function createGatewayRequestContext(
   const workerPlacementDiskSpaceReader = runtime.workerPlacementRuntime?.diskSpace;
   const workerPlacementRunnerAvailabilityReader =
     runtime.workerPlacementRuntime?.runnerAvailability;
+  const workerRepositoryWorkspaceMutationService =
+    runtime.workerPlacementRuntime?.repositoryWorkspaceMutationService;
   const {
     invalidateSessionsForDevice: invalidateDeviceTransports,
     disconnectSessionsForDevice: disconnectDeviceTransports,
@@ -242,16 +245,20 @@ export function createGatewayRequestContext(
     getRuntimeConfig,
     isConfigReloadSettled: () =>
       !lifecycle.closePreludeStarted && runtimeState.configReloader.isConfigReloadSettled(),
+    getDeferredChannelReloads: () =>
+      lifecycle.closePreludeStarted
+        ? []
+        : (runtimeState.configReloader.getDeferredChannelReloads?.() ?? []),
     getGatewayMethodRegistry: runtime.getAttachedGatewayMethodRegistry,
-    gatewayTlsFingerprint: runtime.gatewayTls.enabled
-      ? runtime.gatewayTls.fingerprintSha256
-      : undefined,
+    get gatewayTlsFingerprint() {
+      return runtime.gatewayTls.enabled ? runtime.gatewayTls.fingerprintSha256 : undefined;
+    },
     controlUiSessionPullRequests: runtimeState.controlUiSessionPullRequests,
     sessionViewerPresence: runtimeState.sessionViewerPresence,
     sessionCompanion: runtime.sessionCompanion,
     sessionObserver,
     mentionInbox: runtime.mentionInbox,
-    notifyPluginMetadataChanged: runtime.kernel.notifyPluginMetadataChanged,
+    applyPluginLifecycleChange: runtime.kernel.applyPluginLifecycleChange,
     getMcpAppSandboxPort: runtime.transportBridge.getMcpAppSandboxPort,
     ensureSandboxHostPort: runtime.transportBridge.ensureSandboxHostPort,
     get portalService() {
@@ -470,6 +477,9 @@ export function createGatewayRequestContext(
     ...(workerSessionPlacementService ? { workerSessionPlacementService } : {}),
     ...(workerPlacementDiskSpaceReader ? { workerPlacementDiskSpaceReader } : {}),
     ...(workerPlacementRunnerAvailabilityReader ? { workerPlacementRunnerAvailabilityReader } : {}),
+    ...(workerRepositoryWorkspaceMutationService
+      ? { workerRepositoryWorkspaceMutationService }
+      : {}),
     validateAgentRuntimeApprovalAuthority: runtime.validateAgentRuntimeApprovalAuthority,
     ...(runtime.workerPlacementControlAvailable
       ? { workerPlacementDispatchService: runtime.workerPlacementControlAvailable }

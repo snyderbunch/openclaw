@@ -4,15 +4,13 @@ import { fileURLToPath } from "node:url";
 import type { Model } from "openclaw/plugin-sdk/llm";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ModelProviderConfig, OpenClawConfig } from "../config/config.js";
+import { NON_ENV_SECRETREF_MARKER } from "../secrets/provider-credential-values.js";
 import { resolveAuthProfileSecretOwnerId } from "../secrets/runtime-auth-profile-owner.js";
 import type { SecretSurfaceUnavailableError } from "../secrets/runtime-degraded-state.js";
 import { captureEnv, deleteTestEnvValue, setTestEnvValue } from "../test-utils/env.js";
 import type { AuthProfileStore } from "./auth-profiles.js";
-import {
-  CUSTOM_LOCAL_AUTH_MARKER,
-  GCP_VERTEX_CREDENTIALS_MARKER,
-  NON_ENV_SECRETREF_MARKER,
-} from "./model-auth-markers.js";
+import { createApiKeyCredential } from "./auth-profiles/credential-fixtures.test-support.js";
+import { CUSTOM_LOCAL_AUTH_MARKER, GCP_VERTEX_CREDENTIALS_MARKER } from "./model-auth-markers.js";
 import {
   attachModelProviderRequestTransport,
   getModelProviderRequestTransport,
@@ -82,8 +80,10 @@ vi.mock("../plugins/setup-registry.js", () => ({
   resolvePluginSetupProviderCore: () => undefined,
 }));
 
-vi.mock("../plugins/provider-external-auth.js", () => ({
-  resolveExternalAuthProfilesWithPlugins: () => [],
+vi.mock("../plugins/provider-external-auth-core.js", () => ({
+  createProviderExternalAuthResolver: () => ({
+    resolveExternalAuthProfilesWithPlugins: () => [],
+  }),
 }));
 
 vi.mock("../plugins/provider-runtime.js", () => {
@@ -535,11 +535,7 @@ describe("resolveModelAuthMode", () => {
           provider: "openai",
           token: "token-value",
         },
-        "openai:key": {
-          type: "api_key",
-          provider: "openai",
-          key: "api-key",
-        },
+        "openai:key": createApiKeyCredential("openai", "api-key"),
       },
     };
 

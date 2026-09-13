@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createDeferred } from "../../test/helpers/promise.js";
+import { createRetainedCache } from "../infra/retained-cache.js";
 import type { ControlUiSessionPullRequests } from "./control-ui-contract.js";
-import { createSessionPullRequestCache } from "./control-ui-session-pr-cache.js";
 import {
   createControlUiSessionPullRequestSubscriptions,
   parseControlUiSessionPullRequestsSubscribeParams,
@@ -34,7 +34,7 @@ describe("control UI session PR subscriptions", () => {
   ])(
     "retires cache retention before late completion on $cleanup with failing=$failing",
     async ({ cleanup, failing }) => {
-      const cache = createSessionPullRequestCache<number>();
+      const cache = createRetainedCache<number>();
       const entered = createDeferred();
       const held = createDeferred();
       const signals: AbortSignal[] = [];
@@ -192,6 +192,26 @@ describe("control UI session PR subscriptions", () => {
         .map(([params]) => params.sessionKey)
         .toSorted((left, right) => left.localeCompare(right)),
     ).toEqual(["only-a", "only-b", "shared"]);
+  });
+
+  it("keeps a delivered audience snapshot when a send disconnects a watcher", async () => {
+    let revision = 0;
+    const load = vi.fn(async () => ({ ...READY, rateLimited: revision > 0 }));
+    const broadcastToConnIds = vi.fn();
+    active = createControlUiSessionPullRequestSubscriptions({ broadcastToConnIds, load });
+    await active.replace("conn-a", ["shared"]);
+    await active.replace("conn-b", ["shared"]);
+    broadcastToConnIds.mockClear();
+    broadcastToConnIds.mockImplementationOnce(() => active!.unsubscribe("conn-b"));
+
+    revision++;
+    await active.pollNow();
+
+    expect(broadcastToConnIds.mock.calls[0]?.[2]).toEqual(new Set(["conn-a", "conn-b"]));
+    broadcastToConnIds.mockClear();
+    revision = 0;
+    await active.pollNow();
+    expect(broadcastToConnIds.mock.calls[0]?.[2]).toEqual(new Set(["conn-a"]));
   });
 
   it("shares the four-load limit across connections, hydration, and polling", async () => {
@@ -733,17 +753,27 @@ describe("control UI session PR subscriptions", () => {
 
   it("propagates rate-limit and failure states per key", async () => {
     vi.useFakeTimers();
-    const load = vi.fn(async ({ sessionKey }: { sessionKey: string }) => {
-      if (sessionKey === "limited") {
-        return { pullRequests: [], rateLimited: true };
-      }
-      throw new Error("GitHub unavailable");
-    });
+    const load = vi.fn(
+      async ({ sessionKey }: { sessionKey: string }): Promise<ControlUiSessionPullRequests> => {
+        if (sessionKey === "limited") {
+          return { pullRequests: [], rateLimited: true };
+        }
+        if (sessionKey === "repository-only") {
+          return {
+            pullRequests: [],
+            repository: { owner: "openclaw", repo: "openclaw" },
+            rateLimited: false,
+            status: "unavailable",
+          };
+        }
+        throw new Error("GitHub unavailable");
+      },
+    );
     const broadcastToConnIds = vi.fn();
     active = createControlUiSessionPullRequestSubscriptions({ broadcastToConnIds, load });
 
-    await active.replace("conn-a", ["limited", "failed"]);
-    expect(broadcastToConnIds).toHaveBeenCalledTimes(2);
+    await active.replace("conn-a", ["limited", "failed", "repository-only"]);
+    expect(broadcastToConnIds).toHaveBeenCalledTimes(3);
     const sessions = Object.assign(
       {},
       ...broadcastToConnIds.mock.calls.map((call) => call[1].sessions),
@@ -751,6 +781,12 @@ describe("control UI session PR subscriptions", () => {
     expect(sessions).toEqual({
       limited: { pullRequests: [], rateLimited: true, status: "rate-limited" },
       failed: { pullRequests: [], rateLimited: false, status: "unavailable" },
+      "repository-only": {
+        pullRequests: [],
+        repository: { owner: "openclaw", repo: "openclaw" },
+        rateLimited: false,
+        status: "unavailable",
+      },
     });
   });
 });

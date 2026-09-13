@@ -1,6 +1,11 @@
 export * from "./error-details.js";
 export * from "./github-publication-api.js";
 export * from "./session-agent-status.js";
+export type {
+  ModelCatalogScope,
+  ModelCatalogTarget,
+  ModelsSnapshotEvent,
+} from "./model-catalog-publication.js";
 export * from "./terminal-validators.js";
 export {
   validateApprovalGetResult,
@@ -17,6 +22,7 @@ export * from "./schema/ui-command.js";
 export * from "./schema/board.js";
 export * from "./schema/canvas.js";
 export * from "./schema/progress-card.js";
+export * from "./schema/transcripts.js";
 export {
   SessionCreatedActorSchema,
   SessionEntryArchiveReasonSchema,

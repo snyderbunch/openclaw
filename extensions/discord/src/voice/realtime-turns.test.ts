@@ -37,6 +37,19 @@ defineDiscordVoiceTests(
     expectUserMessageIncludes,
     expectUserMessageNotIncludes,
   }) => {
+    it("leaves trailing silence to the provider's input clock", async () => {
+      realtimeSessionMock.bridge.pacesInputAudio = true;
+      const { entry, manager } = await createJoinedAgentProxyFixture();
+      try {
+        const turn = beginSpeakerTurn(entry);
+        expect(realtimeSessionMock.sendAudio).toHaveBeenCalled();
+        const microphoneWrites = realtimeSessionMock.sendAudio.mock.calls.length;
+        turn.close();
+        expect(realtimeSessionMock.sendAudio).toHaveBeenCalledTimes(microphoneWrites);
+      } finally {
+        await manager.destroy();
+      }
+    });
     it.each(["before-final", "before-delivery"] as const)(
       "keeps realtime transcript output with its retired audio binding %s",
       async (ordering) => {
@@ -105,6 +118,7 @@ defineDiscordVoiceTests(
       expect(providerOptions.configuredProviderId).toBeUndefined();
       expect(providerOptions.agentId).toBe("agent-1");
       expect(providerOptions.defaultModel).toBe("gpt-realtime-2");
+      expect(providerOptions.useProviderDefaultModel).toBe(true);
       expect(requireRecord(providerOptions.providerConfigs, "provider configs").openai).toEqual({
         model: "provider-default",
         voice: "marin",
@@ -946,8 +960,10 @@ defineDiscordVoiceTests(
       expectUserMessageIncludes("owner answer");
     });
 
-    it("skips incomplete and non-actionable forced agent-proxy transcripts", async () => {
-      agentCommandMock.mockResolvedValueOnce({ payloads: [{ text: "valid answer" }] });
+    it("skips complete closings while retaining actionable forced agent-proxy transcripts", async () => {
+      agentCommandMock
+        .mockResolvedValueOnce({ payloads: [{ text: "Synthetic goodbye draft." }] })
+        .mockResolvedValueOnce({ payloads: [{ text: "valid answer" }] });
       const { bridgeParams, entry } = await createJoinedAgentProxyFixture();
 
       beginSpeakerTurn(entry);
@@ -958,6 +974,13 @@ defineDiscordVoiceTests(
         bridgeParams?.onTranscript?.("user", "I'll be right back. See you guys. Bye-bye.", true);
       });
       expect(agentCommandMock).not.toHaveBeenCalled();
+
+      beginSpeakerTurn(entry);
+      await emitFinalRealtimeUserTranscript(bridgeParams, "Write a goodbye email to Sam");
+      expect(agentCommandMock).toHaveBeenCalledOnce();
+      expect(lastAgentCommandArgs().message).toBe("Write a goodbye email to Sam");
+      expectUserMessageIncludes("Synthetic goodbye draft.");
+      bridgeParams.onEvent?.({ direction: "server", type: "response.done" });
 
       beginSpeakerTurn(entry);
       await emitFinalRealtimeUserTranscript(bridgeParams, "ship it.");

@@ -5,6 +5,7 @@ import { asNullableRecord as asConfigRecord } from "@openclaw/normalization-core
 import { html, nothing, type PropertyValues } from "lit";
 import { property, state } from "lit/decorators.js";
 import type {
+  PluginsListResult,
   SessionsCatalogListResult,
   SystemInfoResult,
 } from "../../../../packages/gateway-protocol/src/index.js";
@@ -13,6 +14,7 @@ import type { ModelCatalogEntry } from "../../api/types.ts";
 import { subtitleForRoute, titleForRoute } from "../../app-navigation.ts";
 import { pathForRoute, type RouteId } from "../../app-route-paths.ts";
 import { applicationContext, type ApplicationContext } from "../../app/context.ts";
+import { hasNativeBrowserBridge } from "../../app/native-browser-host.ts";
 import { hasOperatorAdminAccess, hasOperatorWriteAccess } from "../../app/operator-access.ts";
 import { isBrowserPanelAvailable } from "../../app/panel-availability.ts";
 import { isAppearancePref, type ResettableServerUiPrefKey } from "../../app/server-prefs-state.ts";
@@ -34,6 +36,7 @@ import {
   createUpdateProgressWatcher,
   type UpdateProgress,
 } from "../../app/update-confirmation.ts";
+import { canReportUpdateFailure } from "../../app/update-failure-report-controller.ts";
 import { CONTROL_UI_BUILD_INFO } from "../../build-info.ts";
 import {
   loadStoredHiddenSessionCatalogIds,
@@ -76,6 +79,7 @@ import {
 import * as themeImport from "./custom-theme-import-owner.ts";
 import { importCustomThemeFromUrl } from "./custom-theme-import.ts";
 import { renderMcp } from "./mcp.ts";
+import { renderMeetingCapture } from "./meeting-capture.ts";
 import { renderMemoryPage } from "./memory-page.ts";
 import { narrowMemorySchema } from "./memory-schema.ts";
 import { configTargetIdFromHash, type ConfigRouteData } from "./route-data.ts";
@@ -84,6 +88,7 @@ import {
   buildSessionObserverTogglePatch,
   buildSessionObserverUtilityModelPatch,
 } from "./session-observer-settings.ts";
+import { renderSessionStorage } from "./session-storage.ts";
 import { renderTalkPage } from "./talk-page.ts";
 import { renderUpdates } from "./updates.ts";
 import {
@@ -122,13 +127,22 @@ type ConfigPageSetting =
 // Sections relocated by the settings restructure, keyed by "<oldPage>:<section>".
 // Kept so pre-restructure bookmarks and generated links still land somewhere
 // sensible instead of silently opening the old page's default section.
-const MOVED_SECTION_ROUTES: Record<string, { routeId: RouteId; keepSection: boolean }> = {
+const MOVED_SECTION_ROUTES: Record<
+  string,
+  { routeId: RouteId; keepSection: boolean; search?: string; advanced?: boolean }
+> = {
   "communications:__notifications__": { routeId: "notifications", keepSection: false },
   "communications:channels": { routeId: "channels", keepSection: false },
   "communications:broadcast": { routeId: "advanced", keepSection: true },
   "communications:talk": { routeId: "talk", keepSection: true },
   "appearance:wizard": { routeId: "advanced", keepSection: true },
+  "advanced:transcripts": { routeId: "communications", keepSection: true, advanced: true },
   "automation:approvals": { routeId: "security", keepSection: true },
+  "automation:plugins": {
+    routeId: "plugin-settings",
+    keepSection: false,
+    search: "?tab=advanced",
+  },
   "ai-agents:memory": { routeId: "memory", keepSection: true },
   "ai-agents:models": { routeId: "model-providers", keepSection: false },
 };
@@ -137,33 +151,11 @@ const SESSION_OBSERVER_STATUS_POLL_INTERVAL_MS = 10_000;
 const EMPTY_SESSION_CATALOG_LABELS: ReadonlyMap<string, string> = new Map();
 
 function defaultConfigSelection(pageId: ConfigPageId): ConfigSelection {
-  switch (pageId) {
-    case "communications":
-      return { activeSection: "messages", activeSubsection: null };
-    case "appearance":
-      return { activeSection: "__appearance__", activeSubsection: null };
-    case "notifications":
-      return { activeSection: "__notifications__", activeSubsection: null };
-    case "security":
-      return { activeSection: "security", activeSubsection: null };
-    case "automation":
-      return { activeSection: "commands", activeSubsection: null };
-    case "mcp":
-      return { activeSection: "mcp", activeSubsection: null };
-    case "memory":
-      return { activeSection: "memory", activeSubsection: null };
-    case "talk":
-      return { activeSection: "talk", activeSubsection: null };
-    case "infrastructure":
-      return { activeSection: "gateway", activeSubsection: null };
-    case "updates":
-      return { activeSection: "update", activeSubsection: null };
-    case "ai-agents":
-      return { activeSection: "agents", activeSubsection: null };
-    case "advanced":
-      return { activeSection: null, activeSubsection: null };
+  const activeSection = configSectionKeysForPage(pageId)?.[0] ?? null;
+  if (activeSection === null && pageId !== "advanced") {
+    throw new Error("Unknown config page");
   }
-  throw new Error("Unknown config page");
+  return { activeSection, activeSubsection: null };
 }
 
 function normalizeConfigSelection(
@@ -405,6 +397,27 @@ export class ConfigPage extends OpenClawLightDomElement {
     },
     onError: () => this.resetSessionObserverModels(true),
   });
+  private readonly sessionSourcePluginsTask = new Task(this, {
+    args: () => {
+      const gateway = this.context?.gateway.snapshot;
+      return [
+        this.gateway.gateway,
+        this.pageId === "appearance" &&
+        canCallGatewayMethod(gateway, "plugins.list", "operator.read")
+          ? gateway?.client
+          : null,
+      ] as const;
+    },
+    task: async ([, client], { signal }) => {
+      if (!client) {
+        return null;
+      }
+      const result = await client.request<PluginsListResult>("plugins.list", {}, { signal });
+      return new Set(
+        result.plugins.filter((plugin) => plugin.installed).map((plugin) => plugin.id),
+      );
+    },
+  });
   private readonly hiddenSessionCatalogLabelsTask = new Task(this, {
     args: () => {
       const gateway = this.context?.gateway.snapshot;
@@ -628,8 +641,12 @@ export class ConfigPage extends OpenClawLightDomElement {
       const movedRoute = MOVED_SECTION_ROUTES[`${this.pageId}:${rawSection}`];
       if (movedRoute) {
         this.context?.navigate(movedRoute.routeId, {
-          search: movedRoute.keepSection ? `?section=${encodeURIComponent(rawSection)}` : "",
-          hash: globalThis.location?.hash ?? "",
+          search:
+            movedRoute.search ??
+            (movedRoute.keepSection
+              ? `?section=${encodeURIComponent(rawSection)}${movedRoute.advanced ? "&advanced=1" : ""}`
+              : ""),
+          hash: this.routeData?.hash ?? globalThis.location?.hash ?? "",
         });
         return;
       }
@@ -1044,6 +1061,9 @@ export class ConfigPage extends OpenClawLightDomElement {
         heldUpdateCampaignId: overlaySnapshot.heldUpdateCampaignId,
         updateAvailable: overlaySnapshot.updateAvailable,
         statusBanner: overlaySnapshot.updateStatusBanner,
+        reportableUpdateFailureId: overlaySnapshot.reportableUpdateFailureId,
+        updateFailureReportBusy: overlaySnapshot.updateFailureReportBusy,
+        updateFailureReportNotice: overlaySnapshot.updateFailureReportNotice,
         run: overlaySnapshot.updateRun,
         connected: gatewaySnapshot.phase === "connected",
         configBusy: this.isCuratedConfigMutationDisabled(),
@@ -1051,6 +1071,7 @@ export class ConfigPage extends OpenClawLightDomElement {
         canUpdate: canCallGatewayMethod(gatewaySnapshot, "update.run", "operator.admin"),
         canCheckStatus: canCallGatewayMethod(gatewaySnapshot, "update.status", "operator.admin"),
         canHoldUpdate: canCallGatewayMethod(gatewaySnapshot, "update.hold", "operator.admin"),
+        canReport: canReportUpdateFailure(gatewaySnapshot),
         updateBusy: this.isUpdateBusy(),
         onChannelChange: (channel) => runtimeConfig.patchForm(["update", "channel"], channel),
         onUpdateChecksChange: (enabled) =>
@@ -1071,6 +1092,7 @@ export class ConfigPage extends OpenClawLightDomElement {
           }),
         onHoldUpdate: () => this.context.overlays.holdUpdate(),
         onCheckStatus: () => this.context.overlays.refreshUpdateStatus(),
+        onReportFailure: (attemptId) => this.context.overlays.reportUpdateFailure(attemptId),
       });
     }
     const includeSections = this.includeSections();
@@ -1268,6 +1290,12 @@ export class ConfigPage extends OpenClawLightDomElement {
       setChatFollowUpMode: (value) => this.setSetting("chatFollowUpMode", value),
       resetChatFollowUpMode: () => this.resetSyncedAppearancePref("chatFollowUpMode"),
       catalogOpenTarget: normalizeCatalogOpenTarget(this.settings.catalogOpenTarget),
+      pluginsHref: pathForRoute("plugin-settings", this.context.basePath),
+      installedSessionSourcePluginIds:
+        this.sessionSourcePluginsTask.status === TaskStatus.COMPLETE
+          ? this.sessionSourcePluginsTask.value
+          : null,
+      sessionSourcePluginsLoading: this.sessionSourcePluginsTask.status === TaskStatus.PENDING,
       setCatalogOpenTarget: (value) => this.setSetting("catalogOpenTarget", value),
       microphone: {
         devices: this.microphoneDevices,
@@ -1294,8 +1322,28 @@ export class ConfigPage extends OpenClawLightDomElement {
       configPath: configState.configSnapshot?.path ?? null,
       navRootLabel: this.pageId === "advanced" ? undefined : configPageTitle(this.pageId),
       showSectionDocs: this.pageId !== "communications",
+      renderSection:
+        this.pageId === "communications" && activeSection === "transcripts"
+          ? (editor) =>
+              renderMeetingCapture({
+                mutationDisabled: this.isCuratedConfigMutationDisabled(),
+                advancedExpanded:
+                  this.routeData?.advanced === true ||
+                  this.routeData?.targetBlockId === "config-section-transcripts",
+                editor,
+              })
+          : this.pageId === "ai-agents" && activeSection === "session"
+            ? (editor) =>
+                renderSessionStorage({
+                  mutationDisabled: this.isCuratedConfigMutationDisabled(),
+                  advancedExpanded:
+                    this.routeData?.advanced === true ||
+                    this.routeData?.targetBlockId === "config-section-session",
+                  editor,
+                })
+            : undefined,
       sectionPrelude:
-        activeSection === "browser" && browserPanelAvailable
+        activeSection === "browser" && browserPanelAvailable && !hasNativeBrowserBridge()
           ? renderBrowserLinkPreferencesRow({
               enabled: this.settings.openLinksInControlUiBrowser === true,
               onChange: (enabled) => this.setSetting("openLinksInControlUiBrowser", enabled),

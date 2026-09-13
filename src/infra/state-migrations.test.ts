@@ -65,6 +65,7 @@ import {
   runLegacyStateMigrations as runLegacyStateMigrationsWithSurfaces,
 } from "./state-migrations.doctor.js";
 import * as sessionStore from "./state-migrations.legacy-session-store.js";
+import { throwIfDoctorStateMigrationRefused } from "./state-migrations.messages.js";
 import { autoMigrateLegacyPluginDoctorState } from "./state-migrations.plugin-doctor.js";
 import {
   migrateLegacyCurrentConversationBindings,
@@ -838,7 +839,7 @@ describe("state migrations", () => {
     expect(repaired.warnings).toEqual([]);
     expect(assertReady).not.toThrow();
     expect(fsSync.existsSync(sourcePath)).toBe(false);
-    expect(readWorkspaceStateSnapshot(workspaceDir, { env }).setup.setupCompletedAt).toBe(
+    expect((await readWorkspaceStateSnapshot(workspaceDir, { env })).setup.setupCompletedAt).toBe(
       completedAt,
     );
   });
@@ -2166,7 +2167,7 @@ describe("state migrations", () => {
               ...params,
               context: params.context as PluginDoctorStateMigrationContext,
             });
-            return { changes: result.changes, warnings: result.warnings };
+            return result;
           },
         },
       },
@@ -2197,6 +2198,25 @@ describe("state migrations", () => {
     await expect(readMemoryHostEventRecords({ workspaceDir, env })).resolves.toEqual([event]);
     await expectMissingPath(eventPath);
     await expect(fs.stat(`${eventPath}.migrated`)).resolves.toBeDefined();
+
+    const rewritten = `${JSON.stringify({ ...event, query: "rewritten archive" })}\n`;
+    await fs.writeFile(`${eventPath}.migrated`, rewritten);
+    const continued = await autoMigrateLegacyState({
+      cfg,
+      env,
+      homedir: () => root,
+      doctorOnlyStateMigrations: true,
+    });
+    expect(
+      continued.stepReceipts.find((receipt) => receipt.id === "plugin-doctor-state"),
+    ).toMatchObject({
+      outcome: "warning",
+      warnings: [expect.stringContaining("changed other than by append")],
+    });
+    expect(() => throwIfDoctorStateMigrationRefused(continued.stepReceipts)).not.toThrow();
+    expect(continued.stepReceipts.some((receipt) => receipt.outcome === "refused")).toBe(false);
+    await expect(readMemoryHostEventRecords({ workspaceDir, env })).resolves.toEqual([event]);
+    await expect(fs.readFile(`${eventPath}.migrated`, "utf8")).resolves.toBe(rewritten);
   });
 
   it("runs doctor-only repairs after the automatic migration check", async () => {
@@ -3521,6 +3541,8 @@ describe("state migrations", () => {
   });
 
   it("migrates legacy delivery queue files into shared SQLite state", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(1_000);
     const root = await createTempDir();
     const stateDir = path.join(root, ".openclaw");
     const env = createEnv(stateDir);
@@ -3674,8 +3696,12 @@ describe("state migrations", () => {
         failed_at: 30,
       },
     ]);
-    await expectMissingPath(path.join(stateDir, "delivery-queue"));
-    await expectMissingPath(path.join(stateDir, "session-delivery-queue"));
+    await expect(
+      fs.readFile(path.join(stateDir, "delivery-queue", "outbound-1.json.migrated"), "utf8"),
+    ).resolves.toContain("hi");
+    await expect(
+      fs.readFile(path.join(stateDir, "session-delivery-queue", "session-1.json.migrated"), "utf8"),
+    ).resolves.toContain("resume");
   });
 
   it("migrates legacy voice wake JSON settings into shared SQLite state", async () => {
@@ -3843,7 +3869,7 @@ describe("state migrations", () => {
     expect(result.warnings).toHaveLength(1);
     expect(result.warnings[0]).toContain("Failed reading legacy voice wake triggers");
     expect(result.notices).toBeUndefined();
-    await expect(fs.access(triggersPath)).resolves.toBeUndefined();
+    await fs.access(triggersPath);
     await expectMissingPath(`${triggersPath}.migrated`);
   });
 
@@ -3943,7 +3969,7 @@ describe("state migrations", () => {
     expect(result.warnings).toHaveLength(1);
     expect(result.warnings[0]).toContain("Failed reading legacy voice wake routing");
     expect(result.notices).toBeUndefined();
-    await expect(fs.access(routingPath)).resolves.toBeUndefined();
+    await fs.access(routingPath);
     await expectMissingPath(`${routingPath}.migrated`);
   });
 
@@ -4593,7 +4619,7 @@ describe("state migrations", () => {
     expect(result.changes).toContain("plugin state migrated");
     expect(detectedStateDirs).toStrictEqual([canonicalStateDir]);
     expect(migratedStateDirs).toStrictEqual([canonicalStateDir]);
-    await expect(fs.access(path.join(canonicalStateDir, "legacy.txt"))).resolves.toBeUndefined();
+    await fs.access(path.join(canonicalStateDir, "legacy.txt"));
   });
 
   it("routes explicit Doctor repair through the APNs SQLite importer", async () => {
@@ -5067,7 +5093,7 @@ describe("state migrations", () => {
       },
     ]);
     await expectMissingPath(sourcePath);
-    await expect(fs.access(`${sourcePath}.migrated`)).resolves.toBeUndefined();
+    await fs.access(`${sourcePath}.migrated`);
   });
 
   it("removes a regenerated config health source when its archive already exists", async () => {
@@ -5118,7 +5144,7 @@ describe("state migrations", () => {
 
     expect(result.warnings).toHaveLength(1);
     expect(result.warnings[0]).toContain("Failed reading legacy config health state");
-    await expect(fs.access(sourcePath)).resolves.toBeUndefined();
+    await fs.access(sourcePath);
     await expectMissingPath(`${sourcePath}.migrated`);
   });
 
@@ -5428,7 +5454,7 @@ describe("state migrations", () => {
     expect(result.warnings).toHaveLength(1);
     expect(result.warnings[0]).toContain("Failed reading legacy plugin binding approvals");
     expect(result.notices).toBeUndefined();
-    await expect(fs.access(sourcePath)).resolves.toBeUndefined();
+    await fs.access(sourcePath);
     await expectMissingPath(`${sourcePath}.migrated`);
   });
 
@@ -5513,8 +5539,8 @@ describe("state migrations", () => {
     const result = await runLegacyStateMigrations({ detected, config: cfg, env });
     expect(result.changes.some((change) => change.includes("exec approvals"))).toBe(false);
     expect(result.changes.some((change) => change.includes("plugin binding approval"))).toBe(false);
-    await expect(fs.access(execApprovalsPath)).resolves.toBeUndefined();
-    await expect(fs.access(pluginApprovalsPath)).resolves.toBeUndefined();
+    await fs.access(execApprovalsPath);
+    await fs.access(pluginApprovalsPath);
     await expectMissingPath(path.join(stateDir, "exec-approvals.json"));
     expect(readPluginBindingApprovalRows(env)).toEqual([]);
   });
@@ -5795,7 +5821,7 @@ describe("state migrations", () => {
     expect(result.warnings).toHaveLength(1);
     expect(result.warnings[0]).toContain("Failed reading legacy current-conversation bindings");
     expect(result.notices).toBeUndefined();
-    await expect(fs.access(sourcePath)).resolves.toBeUndefined();
+    await fs.access(sourcePath);
     await expectMissingPath(`${sourcePath}.migrated`);
   });
 
@@ -5818,7 +5844,11 @@ describe("state migrations", () => {
       }),
       "utf8",
     );
-    await fs.writeFile(path.join(queueDir, "outbound-1.delivered"), '{"id":"done"}\n', "utf8");
+    await fs.writeFile(
+      path.join(queueDir, "outbound-completed.delivered"),
+      '{"id":"done"}\n',
+      "utf8",
+    );
     await fs.writeFile(
       path.join(queueDir, "outbound-2.json"),
       JSON.stringify({
@@ -5867,14 +5897,16 @@ describe("state migrations", () => {
     expect(result.changes).toContain(
       "Migrated 2 outbound delivery queue entries → shared SQLite state",
     );
-    expect(result.changes).toContain("Removed 1 outbound delivery queue delivered marker");
+    expect(result.changes).toContain(
+      `Archived outbound delivery queue legacy source → ${path.join(queueDir, "outbound-completed.delivered.migrated")}`,
+    );
     expect(result.warnings).toStrictEqual([
       "Left outbound delivery queue in place because 1 entry already existed in shared state: outbound-1",
     ]);
     await expect(fs.readFile(path.join(queueDir, "outbound-1.json"), "utf8")).resolves.toContain(
       '"retryCount":2',
     );
-    await expectMissingPath(path.join(queueDir, "outbound-1.delivered"));
+    await expectMissingPath(path.join(queueDir, "outbound-completed.delivered"));
     expect(
       db
         .prepare(

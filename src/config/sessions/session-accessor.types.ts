@@ -75,7 +75,10 @@ export type SessionEntryReadScope = SessionAccessScope & {
   projection?: "full" | "list";
 };
 
-export type SessionEntryListScope = Partial<Omit<SessionEntryReadScope, "sessionKey">>;
+export type SessionEntryListScope = Partial<Omit<SessionEntryReadScope, "sessionKey">> & {
+  /** Select exact persisted keys after validating the complete listing snapshot. */
+  sessionKeys?: readonly string[];
+};
 
 export type ResolvedSessionEntryAccessTarget = {
   /** Agent owner inferred from the canonical session key. */
@@ -308,6 +311,8 @@ export type TranscriptMessageAppendOptions<TMessage> = {
   cwd?: string;
   /** How duplicate message idempotency keys are detected before append. */
   idempotencyLookup?: "scan" | "scan-assistant" | "caller-checked";
+  /** Reject the append when the transcript changed since the caller loaded it. */
+  expectedMutationAt?: number | null;
   /** Provider/channel message payload to persist. */
   message: TMessage;
   /** Testable timestamp override for the generated transcript entry. */
@@ -751,6 +756,8 @@ export type SessionMessageCutMutationParams = {
   sessionStoreKey?: string;
   storePath?: string;
   targetKey?: string;
+  /** Distinct repository owner prepared by the fork lifecycle before transcript commit. */
+  repositoryWorkspaceId?: string;
 };
 
 export type SessionBranchSummary = {

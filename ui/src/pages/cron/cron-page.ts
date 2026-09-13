@@ -1,12 +1,7 @@
 import { consume } from "@lit/context";
 import { html, type PropertyValues } from "lit";
 import { property, state } from "lit/decorators.js";
-import type {
-  AgentsListResult,
-  CronJob,
-  CronScratchGetResult,
-  ModelCatalogResult,
-} from "../../api/types.ts";
+import type { AgentsListResult, CronJob, CronScratchGetResult } from "../../api/types.ts";
 import { subtitleForRoute, titleForRoute } from "../../app-navigation.ts";
 import { applicationContext, type ApplicationContext } from "../../app/context.ts";
 import { readGatewayOperatorAccess } from "../../app/operator-access.ts";
@@ -39,6 +34,7 @@ import {
   type CronState,
 } from "../../lib/cron/index.ts";
 import { formatUiError } from "../../lib/format-error.ts";
+import { loadModelCatalog, modelCatalogRefreshError } from "../../lib/model-catalog-store.ts";
 import {
   resolveSessionNavigationAgentId,
   sessionNavigationTarget,
@@ -64,11 +60,12 @@ class CronPage extends OpenClawLightDomElement {
   @state() private heartbeatScratch = "";
 
   private pendingRouteData: ReturnType<typeof resolveCronRouteData> | null = null;
-  private routeJobState: CronState | null = null;
+  private routeJobRequested = false;
   private highlightedRunId: string | null = null;
   private pendingRunScroll = false;
   private modelSuggestionsRequest: { state: CronState; agentId: string } | null = null;
   private heartbeatScratchRequest = 0;
+  private pageHidden = document.visibilityState === "hidden";
   private readonly gateway = new GatewayPageController(this, {
     getGateway: () => this.context?.gateway,
     invalidateRequests: (change) => this.resetGatewayState(change.snapshot),
@@ -80,6 +77,14 @@ class CronPage extends OpenClawLightDomElement {
       }
     },
     ensureInitialData: () => this.ensureInitialData(),
+    onPageActivation: () => {
+      const hidden = document.visibilityState === "hidden";
+      const resumed = this.pageHidden && !hidden;
+      this.pageHidden = hidden;
+      if (resumed) {
+        this.ensureInitialData(true);
+      }
+    },
   });
   private readonly observeAgentScope = watchAgentScope((scopeId) => {
     this.pendingRouteData = null;
@@ -145,10 +150,14 @@ class CronPage extends OpenClawLightDomElement {
     this.clearHeartbeatScratch();
     invalidateCronRefresh(this.cron);
     const connected = snapshot?.phase === "connected";
-    this.cron = createInitialCronState({
+    const cron = createInitialCronState({
       client: snapshot?.client ?? null,
       connected,
     });
+    cron.canRefresh = () => this.canRefreshCron(cron);
+    this.cron = cron;
+    this.routeJobRequested = false;
+    this.pageHidden = document.visibilityState === "hidden";
     this.cron.cronAgentId = this.context.agentSelection.state.scopeId;
     this.agentsList = connected ? this.context.agents.state.agentsList : null;
     this.cronModelSuggestions = [];
@@ -160,14 +169,18 @@ class CronPage extends OpenClawLightDomElement {
     this.agentsList = this.context.agents.state.agentsList;
   }
 
-  private ensureInitialData() {
-    if (!this.cron.connected || !this.cron.client) {
+  private canRefreshCron(cron: CronState = this.cron) {
+    return this.isConnected && this.cron === cron && document.visibilityState !== "hidden";
+  }
+
+  private ensureInitialData(forceRefresh = false) {
+    if (!this.canRefreshCron() || !this.cron.connected || !this.cron.client) {
       return;
     }
     if (!this.agentsList && !this.context.agents.state.agentsLoading) {
       void this.context.agents.ensureList();
     }
-    if (!this.cron.cronStatus && !this.cron.cronLoading) {
+    if (forceRefresh || (!this.cron.cronStatus && !this.cron.cronLoading)) {
       void this.refreshCron({ tableFilters: true, coalesce: true });
     } else if (!this.cron.cronRuns.length && !this.cron.cronRunsLoadingMore) {
       void this.loadRuns(this.cron.cronRunsScope === "all" ? null : this.cron.cronRunsJobId);
@@ -190,7 +203,7 @@ class CronPage extends OpenClawLightDomElement {
       this.cron.cronError = null;
       const routeData = resolveCronRouteData(this.routeSearch);
       this.pendingRouteData = routeData.jobId ? routeData : null;
-      this.routeJobState = null;
+      this.routeJobRequested = false;
       this.highlightedRunId = null;
       this.pendingRunScroll = false;
     }
@@ -212,8 +225,8 @@ class CronPage extends OpenClawLightDomElement {
     }
     const routeData = this.pendingRouteData;
     const client = this.cron.client;
-    if (routeData && client && this.cron.connected && this.routeJobState !== this.cron) {
-      this.routeJobState = this.cron;
+    if (routeData && client && this.cron.connected && !this.routeJobRequested) {
+      this.routeJobRequested = true;
       void this.runCronTask(async (current) => {
         const isCurrent = () =>
           this.isConnected && this.cron === current && this.pendingRouteData === routeData;
@@ -242,7 +255,7 @@ class CronPage extends OpenClawLightDomElement {
 
   private async refreshCron(options: { tableFilters: boolean; coalesce?: boolean }) {
     const cronState = this.cron;
-    if (!cronState.connected || !cronState.client) {
+    if (!this.canRefreshCron(cronState) || !cronState.connected || !cronState.client) {
       return;
     }
     const activeCronJobId = cronState.cronRunsScope === "job" ? cronState.cronRunsJobId : null;
@@ -275,14 +288,10 @@ class CronPage extends OpenClawLightDomElement {
       this.modelSuggestionsRequest === request &&
       this.context.agentSelection.state.selectedId === agentId;
     try {
-      const result = await client.request<ModelCatalogResult>("models.list", {
-        agentId,
-        view: "configured",
-        preparedOnly: true,
-      });
+      const result = await loadModelCatalog(client, { agentId });
       if (isCurrent()) {
         this.cronModelSuggestions = result.models.map((entry) => entry.id);
-        this.modelSuggestionsError = null;
+        this.modelSuggestionsError = modelCatalogRefreshError(result);
       }
     } catch (error) {
       if (isCurrent()) {

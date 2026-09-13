@@ -55,7 +55,7 @@ beforeEach(() => {
   }));
   originalArgv = process.argv;
   originalExitCode = process.exitCode;
-  process.exitCode = undefined;
+  process.exitCode = 0;
   vi.stubEnv("OPENCLAW_TEST_PROJECTS_PARALLEL", "");
   vi.stubEnv("OPENCLAW_BUILD_PRIVATE_QA", "");
   vi.stubEnv("OPENCLAW_E2E_SKIP_BUILD", "");
@@ -73,7 +73,7 @@ beforeEach(() => {
 afterEach(() => {
   patternFiles.cleanup();
   process.argv = originalArgv;
-  process.exitCode = originalExitCode;
+  process.exitCode = originalExitCode ?? 0;
   vi.unstubAllEnvs();
   vi.restoreAllMocks();
 });
@@ -143,11 +143,11 @@ describe("CLI runtime admission", () => {
     fs.writeFileSync(
       preload,
       `import cp from 'node:child_process';
-import { syncBuiltinESMExports } from 'node:module';
+import { syncFixtureBuiltinExports } from ${JSON.stringify(new URL("./fixtures/ci-fixture-runtime.cjs", import.meta.url).href)};
 const spawn = cp.spawn;
 cp.spawn = (bin, args, options) => spawn(process.execPath, ['-e',
   args.includes('scripts/run-node.mjs') ? 'process.exit(91)' : ''], options);
-syncBuiltinESMExports();\n`,
+syncFixtureBuiltinExports();\n`,
     );
     const configArgs = args.includes("--config")
       ? []
@@ -211,6 +211,17 @@ syncBuiltinESMExports();\n`,
         "src/cli/update-dry-run-state.process.test.ts",
       ],
       "runtime",
+    ],
+    [
+      "Codex delivery QA runtime",
+      "scripts/run-vitest.mts",
+      [
+        "run",
+        "--config",
+        "test/vitest/vitest.tooling.config.ts",
+        "test/e2e/qa-lab/runtime/gateway-codex-delivery-cache.test.ts",
+      ],
+      "private-qa",
     ],
     [
       "Gateway core",
@@ -315,7 +326,7 @@ process.stdin.resume();\n`,
               preload,
               `import cp from 'node:child_process';
 import fs from 'node:fs';
-import { syncBuiltinESMExports } from 'node:module';
+import { syncFixtureBuiltinExports } from ${JSON.stringify(new URL("./fixtures/ci-fixture-runtime.cjs", import.meta.url).href)};
 const spawn = cp.spawn;
 cp.spawn = (bin, args, options) => {
   if (args.includes('scripts/run-node.mjs')) return spawn(process.execPath, [${JSON.stringify(builder)}], options);
@@ -325,7 +336,7 @@ cp.spawn = (bin, args, options) => {
   }
   return spawn(bin, args, options);
 };
-syncBuiltinESMExports();\n`,
+syncFixtureBuiltinExports();\n`,
             );
             const child = spawn(
               process.execPath,
@@ -413,6 +424,131 @@ async function start(args: string[]) {
   startCount += 1;
   await import(entryUrl);
 }
+
+describe("full-suite timing metadata", () => {
+  it("records inherited include selections without replacing whole-config history", async () => {
+    const timings = await import("../../scripts/lib/vitest-shard-timings.mts");
+    const actual = await vi.importActual<
+      typeof import("../../scripts/lib/vitest-shard-timings.mts")
+    >("../../scripts/lib/vitest-shard-timings.mts");
+    const { runTestProjects } = await import("../../scripts/test-projects-run.mts");
+    const root = tempDirs.make("inherited-timing-");
+    const timingFile = path.join(root, "timings.json");
+    vi.stubEnv("OPENCLAW_TEST_PROJECTS_TIMINGS_PATH", timingFile);
+    vi.stubEnv("OPENCLAW_VITEST_SHARD_NAME", "same-parent");
+    const config = "test/vitest/vitest.tooling.config.ts";
+    actual.writeShardTimings([actual.createShardTimingSample({ config }, 999_999)], root);
+    const writeTimings = vi
+      .spyOn(timings, "writeShardTimings")
+      .mockImplementation(actual.writeShardTimings);
+    commands.prepare.mockResolvedValue(0);
+    commands.reader.mockImplementation(() => ({
+      completion: Promise.resolve({ code: 0, signal: null, groupJoined: true }),
+      getForwardedSignal: () => undefined,
+    }));
+    const files = ["test/scripts/run-with-env.test.ts", "test/scripts/run-node.test.ts"];
+    for (const file of files) {
+      const includeFile = patternFiles.writePatternFile("timing-include.json", [file]);
+      vi.stubEnv("OPENCLAW_VITEST_INCLUDE_FILE", includeFile);
+      await runTestProjects(async () => {}, [config]);
+      expect(fs.existsSync(includeFile)).toBe(true);
+      expect(commands.reader.mock.lastCall?.[0].env.OPENCLAW_VITEST_INCLUDE_FILE).toBe(includeFile);
+    }
+    const inheritedFile = process.env.OPENCLAW_VITEST_INCLUDE_FILE;
+    fs.writeFileSync(inheritedFile!, "{}");
+    await runTestProjects(async () => {}, [files[0]!]);
+    const inlineFile = commands.reader.mock.lastCall?.[0].env.OPENCLAW_VITEST_INCLUDE_FILE;
+    expect(inlineFile).not.toBe(inheritedFile);
+    expect(fs.existsSync(inheritedFile!)).toBe(true);
+    expect(fs.existsSync(inlineFile)).toBe(false);
+    const planner = await import("../../scripts/test-projects.test-support.mts");
+    const empty = vi.spyOn(planner, "buildFullSuiteVitestRunPlans").mockReturnValue([]);
+    await runTestProjects(async () => {}, []);
+    empty.mockRestore();
+    expect(commands.reader).toHaveBeenCalledTimes(3);
+    const samples = writeTimings.mock.calls.flatMap(([entries]) => entries);
+    expect(samples).toHaveLength(3);
+    expect(new Set(samples.map((sample) => sample?.config)).size).toBe(3);
+    expect(samples.every((sample) => sample?.includePatternCount === 1)).toBe(true);
+    const stored = JSON.parse(fs.readFileSync(timingFile, "utf8")).configs;
+    expect(stored[config].averageMs).toBe(999_999);
+    expect(Object.keys(stored)).toHaveLength(4);
+    vi.stubEnv("OPENCLAW_VITEST_INCLUDE_FILE", "");
+    const cliConfig = "test/vitest/vitest.cli.config.ts";
+    await runTestProjects(async () => {}, [cliConfig]);
+    expect(writeTimings.mock.lastCall?.[0]).toEqual([
+      expect.objectContaining({ config: cliConfig, includePatternCount: 0 }),
+    ]);
+  });
+
+  it.each([false, true])(
+    "carries chunk targets without changing launch selection (inherited=%s)",
+    async (inherited) => {
+      vi.stubEnv("OPENCLAW_TEST_PROJECTS_PARALLEL", "2");
+      vi.stubEnv("OPENCLAW_VITEST_MAX_WORKERS", "1");
+      vi.stubEnv("OPENCLAW_VITEST_SHARD_NAME", "same-parent");
+      vi.stubEnv("OPENCLAW_VITEST_ENABLE_MAGLEV", "0");
+      const planner = await import("../../scripts/test-projects.test-support.mts");
+      const timings = await import("../../scripts/lib/vitest-shard-timings.mts");
+      const { runTestProjects } = await import("../../scripts/test-projects-run.mts");
+      const files = ["test/scripts/run-with-env.test.ts", "test/scripts/run-node.test.ts"];
+      const includeFile = inherited
+        ? patternFiles.writePatternFile("chunk-include.json", [files[0]!])
+        : undefined;
+      if (includeFile) {
+        vi.stubEnv("OPENCLAW_VITEST_INCLUDE_FILE", includeFile);
+      }
+      const config = "test/vitest/vitest.tooling.config.ts";
+      vi.spyOn(planner, "buildFullSuiteVitestRunPlans").mockReturnValue(
+        files.map((file) => ({
+          config,
+          forwardedArgs: [file],
+          timingTargets: [file],
+          includePatterns: null,
+          watchMode: false,
+        })),
+      );
+      const writeTimings = vi.spyOn(timings, "writeShardTimings");
+      commands.prepare.mockResolvedValue(0);
+      commands.reader.mockImplementation(() => ({
+        completion: Promise.resolve({ code: 0, signal: null, groupJoined: true }),
+        getForwardedSignal: () => undefined,
+      }));
+
+      await runTestProjects(async () => {}, []);
+
+      expect(commands.reader).toHaveBeenCalledTimes(2);
+      const launches = commands.reader.mock.calls.map(([input]) => input);
+      expect(launches.map((input) => input.pnpmArgs)).toEqual(
+        files.map((file) => [
+          "exec",
+          "node",
+          "--no-maglev",
+          resolveVitestCliEntry(),
+          "run",
+          "--config",
+          config,
+          file,
+        ]),
+      );
+      for (const input of launches) {
+        if (includeFile) {
+          expect(input.env.OPENCLAW_VITEST_INCLUDE_FILE).toBe(includeFile);
+        } else {
+          expect(input.env.OPENCLAW_VITEST_INCLUDE_FILE).toBeFalsy();
+        }
+        expect(input.env.OPENCLAW_VITEST_MAX_WORKERS).toBe("1");
+      }
+      expect(writeTimings).toHaveBeenCalledTimes(1);
+      const samples = writeTimings.mock.calls[0]?.[0] ?? [];
+      expect(samples).toHaveLength(2);
+      expect(new Set(samples.map((sample) => sample?.config)).size).toBe(2);
+      for (const sample of samples) {
+        expect(sample).toMatchObject({ baseConfig: config, includePatternCount: 1 });
+      }
+    },
+  );
+});
 
 describe("parallel cache lease completion", () => {
   it.each([
@@ -546,7 +682,7 @@ describe("parallel cache lease completion", () => {
       expect(uiPaths).toHaveLength(4);
       expect(new Set(uiPaths).size).toBe(1);
       expect(attempts).toBe(2);
-      expect(process.exitCode).toBeUndefined();
+      expect(process.exitCode).toBe(0);
     },
   );
 
@@ -555,6 +691,7 @@ describe("parallel cache lease completion", () => {
     async (outcome) => {
       const groupJoined = process.platform !== "win32";
       vi.stubEnv("OPENCLAW_TEST_PROJECTS_PARALLEL", "2");
+      commands.prepare.mockResolvedValue(0);
       const { runTestProjects } = await import("../../scripts/test-projects-run.mts");
       const first = createDeferred<{
         code: number;
@@ -635,6 +772,7 @@ describe("test-projects build admission", () => {
   const toolingConfig = "test/vitest/vitest.tooling.config.ts";
   const ordinaryTooling = "test/scripts/run-vitest-state-cleanup.test.ts";
   const runtimeTooling = "test/e2e/qa-lab/runtime/gateway-support-export-runtime.test.ts";
+  const privateQaTooling = "test/e2e/qa-lab/runtime/gateway-codex-delivery-cache.test.ts";
 
   it.each([
     {
@@ -647,6 +785,12 @@ describe("test-projects build admission", () => {
       name: "borrowed runtime tooling",
       args: [toolingConfig],
       include: [runtimeTooling],
+      build: true,
+    },
+    {
+      name: "borrowed private-QA tooling",
+      args: [toolingConfig],
+      include: [privateQaTooling],
       build: true,
     },
     { name: "borrowed empty selection", args: [toolingConfig], include: [], build: false },
@@ -784,7 +928,7 @@ describe("test-projects build admission", () => {
       }
       expect(await terminal.promise).toMatch(/^\[test\] passed 2 Vitest shards/u);
       expect(commands.reader).toHaveBeenCalledTimes(2);
-      expect(process.exitCode).toBeUndefined();
+      expect(process.exitCode).toBe(0);
     },
   );
 
@@ -801,16 +945,18 @@ describe("test-projects build admission", () => {
     expect(process.exitCode).toBe(failure === "throw" ? 1 : 7);
   });
 
-  it.each([modelTarget, "extensions/browser/src/browser/extension-install.test.ts"])(
-    "starts %s without runtime preparation",
-    async (target) => {
-      await start([target]);
-      expect(await terminal.promise).toMatch(/^\[test\] passed 1 Vitest shard/u);
-      expect(commands.prepare).not.toHaveBeenCalled();
-      expect(commands.prepareE2e).not.toHaveBeenCalled();
-      expect(commands.reader).toHaveBeenCalledOnce();
-    },
-  );
+  it.each([
+    modelTarget,
+    "extensions/browser/src/browser/extension-install.test.ts",
+    "test/e2e/qa-lab/runtime/package-openclaw-for-docker.e2e.test.ts",
+    "packages/sdk/src/app-sdk-external-boundary.e2e.test.ts",
+  ])("starts %s without runtime preparation", async (target) => {
+    await start([target]);
+    expect(await terminal.promise).toMatch(/^\[test\] passed 1 Vitest shard/u);
+    expect(commands.prepare).not.toHaveBeenCalled();
+    expect(commands.prepareE2e).not.toHaveBeenCalled();
+    expect(commands.reader).toHaveBeenCalledOnce();
+  });
 
   it.each(["build", "failed build", "prebuilt"])(
     "admits the built native-host integration after %s",
@@ -872,10 +1018,10 @@ describe("test-projects build admission", () => {
     },
   );
 
-  it("coalesces mixed E2E and private QA preparation before marking only E2E prebuilt", async () => {
+  it("coalesces mixed package, E2E and private QA preparation before marking only E2E prebuilt", async () => {
     vi.stubEnv("OPENCLAW_TEST_PROJECTS_PARALLEL", "2");
     const preparation = createPreparationGate<NodeJS.ProcessEnv>(commands.prepareE2e);
-    await start([...targets, e2eTarget]);
+    await start([...targets, e2eTarget, "packages/sdk/src/app-sdk-external-boundary.e2e.test.ts"]);
     try {
       await Promise.race([preparation.started, terminal.promise]);
       expect(commands.prepareE2e).toHaveBeenCalledOnce();
