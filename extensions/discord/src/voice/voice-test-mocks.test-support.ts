@@ -1,6 +1,11 @@
 import type { PluginRuntime } from "openclaw/plugin-sdk/channel-core";
-import type { RealtimeVoiceAgentControlResult } from "openclaw/plugin-sdk/realtime-voice";
+import type {
+  controlRealtimeVoiceAgentRun,
+  registerRealtimeVoiceSelection,
+  RealtimeVoiceBridgeSession,
+} from "openclaw/plugin-sdk/realtime-voice";
 import { vi, type Mock } from "vitest";
+import type { VoiceRealtimeSpeakerContext, VoiceSessionEntry } from "./session.js";
 const {
   createConnectionMock,
   getVoiceConnectionMock,
@@ -12,15 +17,18 @@ const {
   agentCommandMock,
   resolveRealtimeBootstrapContextInstructionsMock,
   resolveVoiceIngressWithParticipantsMock,
+  syntheticVoiceAdmissions,
   transcribeAudioFileMock,
   resolveAudioInputBudgetMock,
   prepareTtsRequestMock,
   textToSpeechStreamMock,
   textToSpeechMock,
   logVerboseMock,
+  loggerInfoMock,
   loggerWarnMock,
   loggerErrorMock,
   resolveConfiguredRealtimeVoiceProviderMock,
+  registerRealtimeVoiceSelectionMock,
   createRealtimeVoiceBridgeSessionMock,
   controlRealtimeVoiceAgentRunMock,
   createRealtimeSessionMock,
@@ -122,7 +130,7 @@ const {
     },
     acknowledgeMark: vi.fn() as Mock,
     close: vi.fn() as Mock,
-    connect: vi.fn(async () => undefined),
+    connect: vi.fn<RealtimeVoiceBridgeSession["connect"]>(async () => undefined),
     sendAudio: vi.fn() as Mock,
     sendUserMessage: vi.fn() as Mock,
     handleBargeIn: vi.fn() as Mock,
@@ -133,6 +141,10 @@ const {
   const realtimeSessionMockLocal = createRealtimeSessionMockLocal();
 
   return {
+    syntheticVoiceAdmissions: new WeakMap<
+      VoiceSessionEntry,
+      Map<string, VoiceRealtimeSpeakerContext>
+    >(),
     createConnectionMock: createConnectionMockLocal,
     getVoiceConnectionMock: getVoiceConnectionMockLocal,
     joinVoiceChannelMock: vi.fn(() => createConnectionMockLocal()),
@@ -181,18 +193,24 @@ const {
     })),
     textToSpeechMock: vi.fn(async () => ({ success: true, audioPath: "/tmp/voice.mp3" })),
     logVerboseMock: vi.fn() as Mock,
+    loggerInfoMock: vi.fn() as Mock,
     loggerWarnMock: vi.fn() as Mock,
     loggerErrorMock: vi.fn() as Mock,
     resolveConfiguredRealtimeVoiceProviderMock: vi.fn<
       (params?: {
         configuredProviderId?: string;
+        providerConfigOverrides?: Record<string, unknown>;
         isProviderAvailable?: (provider: { id: string }) => boolean;
         assertProviderAvailable?: (provider: { id: string }) => void;
       }) => {
         provider: {
           id: string;
         };
-        capabilities?: { supportsActivationNameGating?: boolean; handlesAgentConsult?: boolean };
+        capabilities?: {
+          supportsActivationNameGating?: boolean;
+          handlesAgentConsult?: boolean;
+          voices?: string[];
+        };
         providerConfig: Record<string, unknown>;
       }
     >(() => ({
@@ -200,21 +218,20 @@ const {
       capabilities: { supportsActivationNameGating: true },
       providerConfig: { model: "gpt-realtime-2", voice: "cedar" },
     })),
+    registerRealtimeVoiceSelectionMock: vi.fn<typeof registerRealtimeVoiceSelection>(),
     createRealtimeVoiceBridgeSessionMock: vi.fn((_params?: unknown) => realtimeSessionMockLocal),
-    controlRealtimeVoiceAgentRunMock: vi.fn<() => Promise<RealtimeVoiceAgentControlResult>>(
-      async () => ({
-        ok: false,
-        mode: "steer",
-        sessionKey: "discord:g1:c1",
-        active: false,
-        queued: false,
-        reason: "no_active_run",
-        message: "There is no active OpenClaw run to steer.",
-        speak: true,
-        show: true,
-        suppress: false,
-      }),
-    ),
+    controlRealtimeVoiceAgentRunMock: vi.fn<typeof controlRealtimeVoiceAgentRun>(async () => ({
+      ok: false,
+      mode: "steer",
+      sessionKey: "discord:g1:c1",
+      active: false,
+      queued: false,
+      reason: "no_active_run",
+      message: "There is no active OpenClaw run to steer.",
+      speak: true,
+      show: true,
+      suppress: false,
+    })),
     createRealtimeSessionMock: createRealtimeSessionMockLocal,
     realtimeSessionMock: realtimeSessionMockLocal,
     resolveAudioInputBudgetMock:
@@ -231,6 +248,7 @@ const {
 });
 
 export const voiceTestMocks = {
+  syntheticVoiceAdmissions,
   createConnectionMock,
   getVoiceConnectionMock,
   joinVoiceChannelMock,
@@ -247,9 +265,11 @@ export const voiceTestMocks = {
   textToSpeechStreamMock,
   textToSpeechMock,
   logVerboseMock,
+  loggerInfoMock,
   loggerWarnMock,
   loggerErrorMock,
   resolveConfiguredRealtimeVoiceProviderMock,
+  registerRealtimeVoiceSelectionMock,
   createRealtimeVoiceBridgeSessionMock,
   controlRealtimeVoiceAgentRunMock,
   createRealtimeSessionMock,
@@ -333,6 +353,7 @@ vi.mock("openclaw/plugin-sdk/runtime-env", async () => {
     ...actual,
     createSubsystemLogger: (subsystem: string) => ({
       ...actual.createSubsystemLogger(subsystem),
+      info: loggerInfoMock,
       warn: loggerWarnMock,
       error: loggerErrorMock,
     }),
@@ -354,6 +375,9 @@ vi.mock("openclaw/plugin-sdk/realtime-voice", async () => {
   );
   return {
     ...actual,
+    registerRealtimeVoiceSelection: registerRealtimeVoiceSelectionMock.mockImplementation(
+      actual.registerRealtimeVoiceSelection,
+    ),
     canonicalizeRealtimeVoiceProviderId: canonicalizeRealtimeVoiceProviderIdMock,
     createRealtimeVoiceBridgeSession: createRealtimeVoiceBridgeSessionMock,
     createRealtimeVoiceSessionHarness: (
@@ -434,6 +458,7 @@ vi.mock("./audio.js", async () => {
     createDiscordOpusEncodeStream: vi.fn(() =>
       Object.assign(new PassThrough(), {
         flushPartialFrame: () => false,
+        flushPartialFrameWhenReady: () => {},
         takePcmBytes: (packet: Buffer) => packet.length,
       }),
     ),
@@ -450,16 +475,24 @@ vi.mock("./participant-context.js", async () => {
     ...actual,
     resolveDiscordVoiceIngressContextWithParticipants: (
       ...args: Parameters<typeof actual.resolveDiscordVoiceIngressContextWithParticipants>
-    ) =>
-      resolveVoiceIngressWithParticipantsMock.getMockImplementation()
-        ? resolveVoiceIngressWithParticipantsMock(...args)
-        : actual.resolveDiscordVoiceIngressContextWithParticipants(...args),
+    ) => {
+      if (resolveVoiceIngressWithParticipantsMock.getMockImplementation()) {
+        return resolveVoiceIngressWithParticipantsMock(...args);
+      }
+      const context = syntheticVoiceAdmissions.get(args[0].entry)?.get(args[0].userId);
+      return context
+        ? Promise.resolve(context)
+        : actual.resolveDiscordVoiceIngressContextWithParticipants(...args);
+    },
   };
 });
 
 vi.mock("../runtime.js", () => ({
   getDiscordRuntime: () => ({
-    agent: { runCommandFromIngress: agentCommandMock },
+    agent: {
+      runCommandFromIngress: agentCommandMock,
+      session: { getSessionEntry: () => undefined },
+    },
     mediaUnderstanding: {
       resolveAudioInputBudget: resolveAudioInputBudgetMock,
       transcribeAudioFile: transcribeAudioFileMock,

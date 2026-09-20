@@ -117,6 +117,12 @@ export const VITEST_CONFIG_NO_OUTPUT_TIMEOUT_MS = new Map([
     "test/vitest/vitest.full-core-contracts.config.ts",
     DEFAULT_LONG_RUNNING_VITEST_NO_OUTPUT_TIMEOUT_MS,
   ],
+  // The package-acceptance high-cardinality admission test can remain silent
+  // for ~165s under Bun while staying inside its declared 420s test budget.
+  [
+    "test/vitest/vitest.full-core-tooling.config.ts",
+    DEFAULT_LONG_RUNNING_VITEST_NO_OUTPUT_TIMEOUT_MS,
+  ],
   [
     "test/vitest/vitest.contracts-plugin.config.ts",
     DEFAULT_EXTRA_LONG_RUNNING_VITEST_NO_OUTPUT_TIMEOUT_MS,
@@ -144,6 +150,10 @@ export const VITEST_CONFIG_NO_OUTPUT_TIMEOUT_MS = new Map([
     "test/vitest/vitest.gateway-server.config.ts",
     DEFAULT_EXTRA_LONG_RUNNING_VITEST_NO_OUTPUT_TIMEOUT_MS,
   ],
+  [
+    "test/vitest/vitest.gateway-database-workers.config.ts",
+    DEFAULT_EXTRA_LONG_RUNNING_VITEST_NO_OUTPUT_TIMEOUT_MS,
+  ],
 ]);
 for (const owner of embeddedAgentVitestProjectOwners) {
   VITEST_CONFIG_NO_OUTPUT_TIMEOUT_MS.set(
@@ -155,11 +165,14 @@ for (const owner of embeddedAgentVitestProjectOwners) {
  * Resolves default Node flags for Vitest, including the local Maglev opt-in.
  */
 export function resolveVitestNodeArgs(env: NodeJS.ProcessEnv = process.env): string[] {
-  if (parsePermissiveBooleanToken(env.OPENCLAW_VITEST_ENABLE_MAGLEV) === true) {
-    return [];
-  }
-
-  return ["--no-maglev"];
+  // Node 24 can join a Sparkplug compiler at process.exit while that compiler
+  // waits for main-thread GC. Keep baseline compilation on the main thread.
+  return [
+    ...(parsePermissiveBooleanToken(env.OPENCLAW_VITEST_ENABLE_MAGLEV) === true
+      ? []
+      : ["--no-maglev"]),
+    "--no-concurrent-sparkplug",
+  ];
 }
 
 /**
