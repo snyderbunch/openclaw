@@ -1,5 +1,6 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import path from "node:path";
+import { throwSqliteLifecycleErrors } from "../infra/sqlite-coordinator.js";
 import { withSqliteIntegrityWorkerScope } from "../infra/sqlite-integrity-worker.js";
 import {
   AGENT_DATABASE_MAINTENANCE_LEASE,
@@ -7,9 +8,9 @@ import {
   runWithAgentDatabaseMaintenanceAuthority,
 } from "./openclaw-agent-db-lease.js";
 import { closeOpenClawAgentDatabasesAsync } from "./openclaw-agent-db-lifecycle.js";
+import { clearOpenClawAgentDatabaseValidationCache } from "./openclaw-agent-db-validation-cache.js";
 import type { OpenClawStateDatabaseOptions } from "./openclaw-state-db-contract.js";
 import { resolveOpenClawStateSqlitePath } from "./openclaw-state-db.paths.js";
-import type { OpenClawStateMutationOperation } from "./openclaw-state-lease-context.js";
 import { withOpenClawStateLease, type OpenClawStateLeaseContext } from "./openclaw-state-lease.js";
 
 type MaintenanceScope = {
@@ -90,24 +91,6 @@ async function runMaintenanceScope<T>(
           },
         }
       : {}),
-    ...(owner.withDatabaseFileMutation
-      ? {
-          withDatabaseFileMutation<Value, Captured>(
-            operation: OpenClawStateMutationOperation<Value, Captured>,
-          ) {
-            assertAdmission();
-            return track(
-              owner.withDatabaseFileMutation!({
-                ...operation,
-                assertCurrent() {
-                  assertCurrent();
-                  operation.assertCurrent();
-                },
-              }),
-            );
-          },
-        }
-      : {}),
   };
   try {
     return await withSqliteIntegrityWorkerScope(assertCurrent, () =>
@@ -139,14 +122,7 @@ async function runMaintenanceScope<T>(
               errors.push(error);
             }
           }
-          if (errors.length > 1) {
-            throw new AggregateError(errors, "Agent maintenance and nested work failed", {
-              cause: errors[0],
-            });
-          }
-          if (errors.length === 1) {
-            throw errors[0];
-          }
+          throwSqliteLifecycleErrors(errors, "Agent maintenance and nested work failed");
           if ("error" in outcome) {
             throw outcome.error;
           }
@@ -164,6 +140,7 @@ export function withAgentDatabaseMaintenanceLease<T>(
   options: Pick<OpenClawStateDatabaseOptions, "env"> & {
     schemaPolicy?: "existing";
     leaseMs?: number;
+    processBound?: boolean;
   },
   run: (maintenance: OpenClawStateLeaseContext) => Promise<T>,
 ): Promise<T> {
@@ -192,6 +169,7 @@ export function withAgentDatabaseMaintenanceLease<T>(
       waitMs: 5_000,
       prepareDatabase: true,
       heartbeat: "worker",
+      processBound: options.processBound,
       leaseLabel: "agent database maintenance lease",
       operationLabel: "agent.database.maintenance.lease",
     },
@@ -199,6 +177,7 @@ export function withAgentDatabaseMaintenanceLease<T>(
       runMaintenanceScope(databasePath, maintenance, async (lease) => {
         await closeOpenClawAgentDatabasesAsync();
         assertNoOpenClawAgentDatabaseLeases(lease, options);
+        clearOpenClawAgentDatabaseValidationCache();
         return run(lease);
       }),
   );

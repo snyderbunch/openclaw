@@ -6,11 +6,7 @@ import { logVerbose } from "../../globals.js";
 import { toErrorObject } from "../../infra/errors.js";
 import { isAcpSessionKey } from "../../sessions/session-key-utils.js";
 import { AcpRuntimeError } from "../runtime/errors.js";
-import {
-  runAcceptedManagerTurn,
-  type AcceptedTurns,
-  type AcceptedTurnState,
-} from "./manager.accepted-turns.js";
+import { runAcceptedManagerTurn, type AcceptedTurns } from "./manager.accepted-turns.js";
 import { recordQueuedBackgroundTaskCancellation } from "./manager.background-task.js";
 import { cancelManagerAcceptedTurn, runManagerCancelSession } from "./manager.cancel-session.js";
 import { runManagerCloseSession } from "./manager.close-session.js";
@@ -99,7 +95,7 @@ export class AcpSessionManager {
     });
     registerAcpSessionManagerDisposer(this, async (reason) => {
       this.stopping = true;
-      const acceptedTurns: AcceptedTurnState[] = [];
+      const acceptedTurns = [];
       for (const turns of this.acceptedTurns.values()) {
         for (const turn of turns) {
           acceptedTurns.push(turn);
@@ -224,6 +220,7 @@ export class AcpSessionManager {
   }
 
   async getSessionStatus(params: {
+    assertActive?: () => void;
     cfg: OpenClawConfig;
     sessionKey: string;
     agentId?: string;
@@ -235,6 +232,7 @@ export class AcpSessionManager {
       target,
       async (isCurrentActor) =>
         await runManagerGetSessionStatus({
+          assertActive: params.assertActive,
           cfg: params.cfg,
           ...target,
           signal: params.signal,
@@ -249,6 +247,7 @@ export class AcpSessionManager {
   }
 
   async setSessionRuntimeMode(params: {
+    assertActive?: () => void;
     cfg: OpenClawConfig;
     sessionKey: string;
     agentId?: string;
@@ -259,6 +258,7 @@ export class AcpSessionManager {
 
     return await this.withSessionActor(target, async (isCurrentActor) => {
       return await runSetManagerSessionRuntimeMode({
+        assertActive: params.assertActive,
         cfg: params.cfg,
         ...target,
         runtimeMode,
@@ -268,6 +268,7 @@ export class AcpSessionManager {
   }
 
   async setSessionConfigOption(params: {
+    assertActive?: () => void;
     cfg: OpenClawConfig;
     sessionKey: string;
     agentId?: string;
@@ -275,12 +276,11 @@ export class AcpSessionManager {
     value: string;
   }): Promise<AcpSessionRuntimeOptions> {
     const target = resolveAcpSessionTarget(params);
-    const normalizedOption = validateRuntimeConfigOptionInput(params.key, params.value);
-    const key = normalizedOption.key;
-    const value = normalizedOption.value;
+    const { key, value } = validateRuntimeConfigOptionInput(params.key, params.value);
 
     return await this.withSessionActor(target, async (isCurrentActor) => {
       return await runSetManagerSessionConfigOption({
+        assertActive: params.assertActive,
         cfg: params.cfg,
         ...target,
         key,
@@ -291,6 +291,7 @@ export class AcpSessionManager {
   }
 
   async updateSessionRuntimeOptions(params: {
+    assertActive?: () => void;
     cfg: OpenClawConfig;
     sessionKey: string;
     agentId?: string;
@@ -301,6 +302,7 @@ export class AcpSessionManager {
 
     return await this.withSessionActor(target, async (isCurrentActor) => {
       return await runUpdateManagerSessionRuntimeOptions({
+        assertActive: params.assertActive,
         cfg: params.cfg,
         ...target,
         patch: validatedPatch,
@@ -310,6 +312,7 @@ export class AcpSessionManager {
   }
 
   async resetSessionRuntimeOptions(params: {
+    assertActive?: () => void;
     cfg: OpenClawConfig;
     sessionKey: string;
     agentId?: string;
@@ -317,6 +320,7 @@ export class AcpSessionManager {
     const target = resolveAcpSessionTarget(params);
     return await this.withSessionActor(target, async (isCurrentActor) => {
       return await runResetManagerSessionRuntimeOptions({
+        assertActive: params.assertActive,
         cfg: params.cfg,
         ...target,
         ...this.runtimeOptionCommandServices(isCurrentActor),
@@ -333,8 +337,15 @@ export class AcpSessionManager {
       stopping: this.stopping,
       turns: this.acceptedTurns,
       withSessionActor: this.withSessionActor.bind(this),
-      onQueuedCancellation: async () => {
-        recordQueuedBackgroundTaskCancellation({ input, ...target, deps: this.deps, startedAt });
+      onQueuedCancellation: async (assertCurrent) => {
+        await recordQueuedBackgroundTaskCancellation({
+          input,
+          ...target,
+          deps: this.deps,
+          startedAt,
+          assertCurrent,
+        });
+        assertCurrent();
         await emitCancelledAcpTurn(input.onEvent);
         this.recordTurnCompletion({ startedAt });
       },
@@ -358,6 +369,7 @@ export class AcpSessionManager {
   }
 
   async cancelSession(params: {
+    assertActive?: () => void;
     cfg: OpenClawConfig;
     sessionKey: string;
     agentId?: string;
@@ -368,6 +380,7 @@ export class AcpSessionManager {
   }): Promise<void> {
     const target = resolveAcpSessionTarget(params);
     await runManagerCancelSession({
+      assertActive: params.assertActive,
       cfg: params.cfg,
       ...target,
       reason: params.reason,
@@ -466,8 +479,7 @@ export class AcpSessionManager {
       ...params,
       deps: this.deps,
       runtimeHandles: this.runtimeHandles,
-      writeSessionMeta: async (writeParams) => await this.writeSessionMeta(writeParams),
-      isCurrentActor: params.isCurrentActor,
+      writeSessionMeta: this.writeSessionMeta.bind(this),
     });
   }
 
@@ -489,15 +501,11 @@ export class AcpSessionManager {
     this.turnLatencyStats.maxMs = Math.max(this.turnLatencyStats.maxMs, durationMs);
     if (params.errorCode) {
       this.turnLatencyStats.failed += 1;
-      this.recordErrorCode(params.errorCode);
+      const code = normalizeAcpErrorCode(params.errorCode);
+      this.errorCountsByCode.set(code, (this.errorCountsByCode.get(code) ?? 0) + 1);
       return;
     }
     this.turnLatencyStats.completed += 1;
-  }
-
-  private recordErrorCode(code: string): void {
-    const normalized = normalizeAcpErrorCode(code);
-    this.errorCountsByCode.set(normalized, (this.errorCountsByCode.get(normalized) ?? 0) + 1);
   }
 
   private async setSessionState(
@@ -510,12 +518,8 @@ export class AcpSessionManager {
       skipMaintenance: true,
       takeCacheOwnership: true,
       isCurrentActor: params.isCurrentActor,
-      mutate: (current, entry) => {
-        if (!entry) {
-          return null;
-        }
-        const base = current;
-        if (!base) {
+      mutate: (base, entry) => {
+        if (!entry || !base) {
           return null;
         }
         const next: SessionAcpMeta = {
@@ -552,7 +556,7 @@ export class AcpSessionManager {
           cached.handle = handle;
         }
       },
-      writeSessionMeta: async (writeParams) => await this.writeSessionMeta(writeParams),
+      writeSessionMeta: this.writeSessionMeta.bind(this),
     });
   }
 

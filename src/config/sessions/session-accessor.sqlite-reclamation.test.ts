@@ -24,6 +24,7 @@ import {
   getOpenClawAgentDatabaseIfOpen,
   openOpenClawAgentDatabase,
 } from "../../state/openclaw-agent-db.js";
+import { clearOpenClawAgentIntegrityVerification } from "../../state/openclaw-quarantine-store.js";
 import {
   closeOpenClawStateDatabaseAsync,
   closeOpenClawStateDatabaseForTest,
@@ -38,6 +39,7 @@ import {
   replaceSessionEntrySync,
 } from "./session-accessor.sqlite-entry.js";
 import { ensureSessionEntrySync } from "./session-accessor.sqlite-initial-entry.js";
+import { withSqliteSessionPageReclamation } from "./session-accessor.sqlite-page-reclamation.js";
 import {
   createHistoryEvictionReclamationPlan,
   createLifecycleArtifactReclamationPlan,
@@ -85,7 +87,7 @@ vi.mock("./session-accessor.sqlite-reclamation-worker.js", async (importOriginal
     await importOriginal<typeof import("./session-accessor.sqlite-reclamation-worker.js")>();
   return {
     ...actual,
-    withSqliteReclamationWorker: ((options, claim, run, assertRequestCurrent) =>
+    withSqliteReclamationWorker: ((options, claim, run, assertRequestCurrent, signal) =>
       actual.withSqliteReclamationWorker(
         options,
         claim,
@@ -123,6 +125,7 @@ vi.mock("./session-accessor.sqlite-reclamation-worker.js", async (importOriginal
           }
         },
         assertRequestCurrent,
+        signal,
       )) satisfies typeof actual.withSqliteReclamationWorker,
   };
 });
@@ -607,33 +610,25 @@ test("one reclamation pass leaves a large freelist for bounded later maintenance
   }
   const budgetBefore = freePages();
   const databaseOptions = plan.databaseOptions;
-  const duringDrain = yieldToEventLoop().then(() => {
-    expect(budgetBefore - freePages()).toBeGreaterThan(0);
-    expect(budgetBefore - freePages()).toBeLessThanOrEqual(512);
+  await withSqliteSessionPageReclamation(databaseOptions, async (reclaimPages) => {
+    const first = await reclaimPages();
+    expect(first.remainingFreePages).toBeGreaterThan(0);
+    expect(budgetBefore - first.remainingFreePages!).toBeGreaterThan(0);
+    expect(budgetBefore - first.remainingFreePages!).toBeLessThanOrEqual(512);
     expect(database.db.isTransaction).toBe(false);
-    closeOpenClawAgentDatabaseByPath(database.path);
     for (const scope of scopes) {
       expect(appendTranscriptEventSync(scope, { type: "budget-progress" })).toEqual({
         ok: true,
         value: true,
       });
     }
+    await reclaimSqliteFreePages(databaseOptions, undefined, { reclaimPages });
   });
-  // Production retains writer admission across every yielded pass. In particular,
-  // retiring the old handle must queue its Worker checkpoint behind this drain.
-  await Promise.all([
-    runExclusiveSqliteSessionWrite(
-      databaseOptions,
-      () => reclaimSqliteFreePages(databaseOptions),
-      "session.history.free-pages",
-    ),
-    duringDrain,
-  ]);
   const reopened = openOpenClawAgentDatabase(databaseOptions);
   expect(Number(reopened.db.prepare("PRAGMA freelist_count").get()?.freelist_count)).toBe(0);
 });
 
-test("queued and different-store reclamations retain only their own worker identity", async () => {
+test("queued reclamations reuse their database Worker without borrowing another store's identity", async () => {
   const first = createFixture();
   const other = createFixture();
   const diagnostics: SqliteSessionReclamationDiagnostics[] = [{}, {}, {}];
@@ -656,7 +651,8 @@ test("queued and different-store reclamations retain only their own worker ident
     ]);
     const ids = diagnostics.map((record) => record.workerThreadId);
     expect(ids.every((id) => typeof id === "number" && id > 0)).toBe(true);
-    expect(new Set(ids).size).toBe(3);
+    expect(ids[1]).toBe(ids[0]);
+    expect(ids[2]).not.toBe(ids[0]);
   } finally {
     await Promise.allSettled(operations);
   }
@@ -678,10 +674,15 @@ test.each([false, true])(
   async (rejected) => {
     const { databaseOptions, plan } = createFixture();
     closeOpenClawAgentDatabasesForTest(databaseOptions.env.OPENCLAW_STATE_DIR);
+    clearOpenClawAgentIntegrityVerification(databaseOptions.path, databaseOptions.env);
     const file = path.join(tempDirs.make("openclaw-writer-log-"), "writer.log");
     const diagnostics: SqliteSessionReclamationDiagnostics = {};
     const workers: Array<{ worker: Worker; id: number }> = [];
-    const observeWorker = (worker: Worker) => workers.push({ worker, id: worker.threadId });
+    const exits: number[] = [];
+    const observeWorker = (worker: Worker) => {
+      workers.push({ worker, id: worker.threadId });
+      worker.once("exit", (code) => exits.push(code));
+    };
     setLoggerOverride({ level: "info", file });
     process.on("worker", observeWorker);
     let clock = 0;
@@ -737,8 +738,11 @@ test.each([false, true])(
         });
       expect(workers).toHaveLength(1);
       expect(workers[0]?.id).toBeGreaterThan(0);
+      expect(workers[0]?.worker.threadId).toBe(workers[0]?.id);
+      expect(exits).toEqual([]);
       await closeOpenClawAgentDatabasesAsync();
       expect(workers[0]?.worker.threadId).toBe(-1);
+      expect(exits).toEqual([0]);
       expect(records).toHaveLength(3);
       const workerRecords = records.filter((record) => record.workerThreadId === workers[0]?.id);
       expect(workerRecords).toHaveLength(2);
@@ -749,7 +753,7 @@ test.each([false, true])(
         })),
       ).toEqual([
         { id: 1, cause: "worker-release" },
-        { id: 2, cause: rejected ? "worker-exit" : "worker-release" },
+        { id: 2, cause: "worker-release" },
       ]);
       for (const record of workerRecords) {
         expect(record).toMatchObject({
@@ -839,7 +843,7 @@ test("a synchronous writer reports actual reclamation service time inside its BE
       })
       .filter(
         (record) =>
-          record.message === "slow SQLite transaction lock wait" &&
+          record.message === "slow SQLite transaction step" &&
           isRecord(record["1"]) &&
           record["1"].operation === "agent.write",
       );
@@ -881,13 +885,18 @@ test.each([
   async ({ elapsedMs, rejected, failLog }) => {
     const { databaseOptions, plan } = createFixture();
     closeOpenClawAgentDatabasesForTest(databaseOptions.env.OPENCLAW_STATE_DIR);
+    clearOpenClawAgentIntegrityVerification(databaseOptions.path, databaseOptions.env);
     const file = path.join(tempDirs.make("openclaw-reclamation-log-"), "reclamation.log");
     await fs.writeFile(file, "");
     setLoggerOverride({ level: "info", consoleLevel: "silent", file });
     let clock = 0;
     vi.spyOn(performance, "now").mockImplementation(() => clock);
     const workers: Array<{ worker: Worker; id: number }> = [];
-    const observeWorker = (worker: Worker) => workers.push({ worker, id: worker.threadId });
+    const exits: number[] = [];
+    const observeWorker = (worker: Worker) => {
+      workers.push({ worker, id: worker.threadId });
+      worker.once("exit", (code) => exits.push(code));
+    };
     process.on("worker", observeWorker);
     const failure = new Error("synthetic reclamation refusal", {
       cause: new Error("synthetic storage failure; Authorization: Bearer synthetic-private-token"),
@@ -947,8 +956,11 @@ test.each([
       expect(otherWriterRan).toBe(true);
       expect(workers).toHaveLength(1);
       expect(workers[0]?.id).toBeGreaterThan(0);
+      expect(workers[0]?.worker.threadId).toBe(workers[0]?.id);
+      expect(exits).toEqual([]);
       await closeOpenClawAgentDatabasesAsync();
       expect(workers[0]?.worker.threadId).toBe(-1);
+      expect(exits).toEqual([0]);
       expect(records.some((record) => record["1"] === "slow SQLite session write")).toBe(false);
       expect(hooks.workerLogAttempts).toBe(elapsedMs > 0 || rejected ? 1 : 0);
       expect(observations).toHaveLength((elapsedMs > 0 || rejected) && !failLog ? 1 : 0);
@@ -969,7 +981,6 @@ test.each([
           outcome: rejected ? "rejected" : "resolved",
           ...(rejected
             ? {
-                exitCode: 1,
                 sessionIdHash: redactIdentifier(plan.sessionId),
                 error: expect.stringContaining(
                   "synthetic reclamation refusal | synthetic storage failure",

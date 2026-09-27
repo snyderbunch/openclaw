@@ -15,6 +15,7 @@ import { readSqliteUserVersion } from "../infra/sqlite-user-version.js";
 import { VERSION } from "../version.js";
 import {
   LAZY_ADDITIVE_STATE_TABLES,
+  DOCTOR_OWNED_STATE_TABLES,
   OPENCLAW_STATE_SCHEMA_VERSION,
   type OpenClawStateDatabaseOptions,
 } from "./openclaw-state-db-contract.js";
@@ -79,14 +80,6 @@ function repairDanglingSkillWorkshopCollectionReviewIndexChanges(database: Datab
     : [];
 }
 
-/** Run read-only schema admission while SQLite ignores malformed catalog rows. */
-function admitStateDatabaseWithDanglingWorkshopIndex<T>(
-  database: DatabaseSync,
-  operation: () => T,
-): T {
-  return withSqliteWritableSchema(database, operation);
-}
-
 /** Admit the schema before Doctor begins its write transaction. */
 function admitStateDatabaseForSchemaRepair(
   database: DatabaseSync,
@@ -101,7 +94,8 @@ function admitStateDatabaseForSchemaRepair(
     }
   };
   if (danglingWorkshopIndex) {
-    admitStateDatabaseWithDanglingWorkshopIndex(database, admit);
+    // Run read-only admission while SQLite ignores malformed catalog rows.
+    withSqliteWritableSchema(database, admit);
   } else {
     admit();
   }
@@ -118,7 +112,7 @@ function assertStateDatabaseSchemaRepairWriteAllowed(
   const assertAllowed = () =>
     assertOpenClawStateWriteAllowed({ database, databasePath: pathname, env });
   if (danglingWorkshopIndex) {
-    admitStateDatabaseWithDanglingWorkshopIndex(database, assertAllowed);
+    withSqliteWritableSchema(database, assertAllowed);
   } else {
     assertAllowed();
   }
@@ -176,6 +170,7 @@ const STATE_MIGRATION_ALLOWED_MISSING_TABLES = {
   14: LAZY_ADDITIVE_STATE_TABLES,
   15: LAZY_ADDITIVE_STATE_TABLES,
   16: LAZY_ADDITIVE_STATE_TABLES,
+  17: LAZY_ADDITIVE_STATE_TABLES,
 } as const satisfies Record<number, readonly string[]>;
 type OpenClawStateMigrationVersion = keyof typeof STATE_MIGRATION_ALLOWED_MISSING_TABLES;
 
@@ -255,7 +250,10 @@ function assertOpenClawStateDatabaseVersionForMigration(
     );
   }
   assertSqliteSchemaTablesPresent(database, options.pathname, OPENCLAW_STATE_SCHEMA_SQL, {
-    allowedMissingTables: STATE_MIGRATION_ALLOWED_MISSING_TABLES[options.version],
+    allowedMissingTables: [
+      ...STATE_MIGRATION_ALLOWED_MISSING_TABLES[options.version],
+      ...DOCTOR_OWNED_STATE_TABLES,
+    ],
   });
 }
 
@@ -264,7 +262,7 @@ export const openClawStateMigrationAssertions = new Map<
   number,
   (database: DatabaseSync, options: { pathname: string }) => void
 >(
-  ([5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16] as const).map(
+  ([5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17] as const).map(
     (version) =>
       [
         version,
@@ -371,6 +369,26 @@ function migratePreparedWorkerOwnership(db: DatabaseSync, previousVersion: numbe
   // markers commit together, preserving inbound foreign keys and cleanup rows.
   for (const column of columns) {
     changed = ensureColumn(db, "worker_environments", column) || changed;
+  }
+  return changed;
+}
+
+/** Historical publication rows retain unknown requesters; first use still owns absent tables. */
+function migrateGitHubPublicationRequesterAuthority(
+  db: DatabaseSync,
+  previousVersion: number,
+): boolean {
+  if (previousVersion >= 18) {
+    return false;
+  }
+  let changed = false;
+  for (const table of [
+    "github_publication_session_lifecycles",
+    "github_repository_publication_requests",
+  ]) {
+    if (tableExists(db, table)) {
+      changed = ensureColumn(db, table, "requester_authority_json TEXT") || changed;
+    }
   }
   return changed;
 }
@@ -534,6 +552,10 @@ export const versionedStateMigrations: ReadonlyArray<{
     migrate: migratePreparedWorkerOwnership,
     applied: "Recorded prepared worker ownership and one-use lifecycle (v17)",
   },
+  {
+    migrate: migrateGitHubPublicationRequesterAuthority,
+    applied: "Added original requester authority to GitHub publication receipts (v18)",
+  },
 ];
 
 export function runStateSchemaMigrationTransaction<T>(
@@ -638,7 +660,13 @@ export function writeCurrentStateSchemaMetadata(db: DatabaseSync, now: number): 
 
 export function executeCanonicalStateSchema(
   database: DatabaseSync,
-  options: { includeVersionLazyAdditiveTables: boolean },
+  options: { includeVersionLazyAdditiveTables: boolean; includeAgentDeletionJournal?: boolean },
 ): void {
-  database.exec(getOpenClawStateRuntimeSchema(options));
+  database.exec(
+    getOpenClawStateRuntimeSchema({
+      ...options,
+      includeAgentDeletionJournal:
+        options.includeAgentDeletionJournal ?? tableExists(database, "agent_deletion_journal"),
+    }),
+  );
 }

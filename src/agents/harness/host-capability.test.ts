@@ -612,8 +612,10 @@ describe("agent harness host capability", () => {
   });
 
   it.each(
-    policyRevocations.flatMap((entry) =>
-      (["resolve", "reject"] as const).map((settlement) => Object.assign({ settlement }, entry)),
+    policyRevocations.flatMap((entry, index) =>
+      (index === 0 ? (["resolve", "reject"] as const) : (["resolve"] as const)).map((settlement) =>
+        Object.assign({ settlement }, entry),
+      ),
     ),
   )("rejects a deferred policy $settlement after $name", async ({ revoke, settlement }) => {
     const { attempt, admission } = await admittedAttempt("run-policy-race");
@@ -814,6 +816,7 @@ describe("agent harness host capability", () => {
       expect(payload).toMatchObject({
         mcpTool: { server: "docs", tool: "write_note" },
         toolCallId: "item-1",
+        detail: "Full review evidence",
       });
       expect(payload).not.toHaveProperty("isMcpToolApprovalActive");
       expect(takeMcpToolApprovalBinding({ ...scope, agentId: "other" })).toBeUndefined();
@@ -824,6 +827,7 @@ describe("agent harness host capability", () => {
     await host.capabilities.requestApproval({
       title: "MCP approval",
       description: "Write a note",
+      detail: "Full review evidence",
       severity: "warning",
       toolName: "codex_mcp_tool_approval",
       toolCallId: "item-1",

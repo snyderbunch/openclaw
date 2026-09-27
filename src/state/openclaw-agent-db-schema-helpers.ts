@@ -12,13 +12,19 @@ import {
   legacySqliteSchemaIssueMessages,
   throwSqliteSchemaMismatches,
 } from "../infra/sqlite-schema-issues.js";
+import { extractSqliteTableSchema } from "../infra/sqlite-schema-sql.js";
 import { readSqliteUserVersion } from "../infra/sqlite-user-version.js";
 import { normalizeAgentId } from "../routing/session-key.js";
 import {
   AGENT_V14_BOARD_SCHEMA_SQL,
   ensureOpenClawAgentBoardSchemaInTransaction,
 } from "./openclaw-agent-board-schema.js";
-import { OPENCLAW_AGENT_SCHEMA_VERSION } from "./openclaw-agent-db-contract.js";
+import { withoutCanonicalSessionValidationSchema } from "./openclaw-agent-canonical-validation-schema.js";
+import {
+  CANONICAL_SESSION_VALIDATION_SCHEMA_VERSION,
+  OPENCLAW_AGENT_SCHEMA_VERSION,
+  AGENT_STORAGE_SCHEMA_VERSION,
+} from "./openclaw-agent-db-contract.js";
 import { AGENT_SCHEMA_COMPATIBILITY } from "./openclaw-agent-db-schema-compatibility.js";
 import {
   readExistingAgentSchemaMeta,
@@ -26,9 +32,17 @@ import {
 } from "./openclaw-agent-db-schema-read.js";
 import {
   ensureSessionAdditiveColumns,
+  readSqliteTableColumns,
+  hasPendingSessionConversationRouteContextColumn,
+  hasPendingSessionProjectColumn,
+  hasPendingSessionTranscriptContextEligibilityColumn,
   ensureSessionEntryValidityProjection,
 } from "./openclaw-agent-db-session-migrations.js";
-import { LEGACY_PARTICIPANT_OPTIONAL_COLUMNS } from "./openclaw-agent-participants-migration.js";
+import {
+  LEGACY_PARTICIPANT_OPTIONAL_COLUMNS,
+  withLegacySessionParticipantsSchema,
+} from "./openclaw-agent-participants-migration.js";
+import { hasPendingInputConsumptionColumnMigration } from "./openclaw-agent-pending-inputs-schema.js";
 import {
   ensureOpenClawAgentProgressCardSchemaInTransaction,
   AGENT_PROGRESS_CARD_SCHEMA_SQL,
@@ -39,6 +53,8 @@ import {
   AGENT_V14_CORE_SCHEMA_SQL,
   AGENT_V14_SESSION_SHARING_SCHEMA_SQL,
 } from "./openclaw-agent-session-sharing-schema.js";
+import { withLegacyAgentStorageSchema } from "./openclaw-agent-storage-schema.js";
+import { tableExists } from "./openclaw-state-db-schema-helpers.js";
 
 export {
   assertSupportedAgentSchemaVersion,
@@ -46,6 +62,19 @@ export {
   readExistingAgentSchemaMeta,
   assertExistingAgentSchemaOwner,
 } from "./openclaw-agent-db-schema-read.js";
+
+/** Compare historical migration targets against only the representation they support. */
+export function getOpenClawAgentMigrationSchema(targetVersion: number): string {
+  const targetSchemaSql =
+    targetVersion < AGENT_STORAGE_SCHEMA_VERSION
+      ? withLegacyAgentStorageSchema(OPENCLAW_AGENT_SCHEMA_SQL, targetVersion)
+      : OPENCLAW_AGENT_SCHEMA_SQL;
+  return targetVersion < 18
+    ? withLegacySessionParticipantsSchema(targetSchemaSql)
+    : targetVersion < CANONICAL_SESSION_VALIDATION_SCHEMA_VERSION
+      ? withoutCanonicalSessionValidationSchema(targetSchemaSql)
+      : targetSchemaSql;
+}
 
 export function migratedSessionColumn(
   columns: ReadonlySet<string>,
@@ -55,7 +84,7 @@ export function migratedSessionColumn(
   return columns.has(columnName) ? columnName : fallback;
 }
 
-export function hasRetiredAgentStateLeaseSchema(database: DatabaseSync): boolean {
+function hasRetiredAgentStateLeaseSchema(database: DatabaseSync): boolean {
   return Boolean(
     database.prepare("SELECT 1 FROM main.sqlite_schema WHERE name = 'state_leases'").get(),
   );
@@ -150,17 +179,15 @@ function repairAndAssertAgentSchemaGroup(
   assertOpenClawAgentSchemaContains(database, pathname, schemaSql, "legacy");
 }
 
-const SESSION_KEY_CONTRACT_SCHEMA_START = "CREATE TABLE IF NOT EXISTS session_key_contract (";
-const SESSION_KEY_CONTRACT_SCHEMA_END = "CREATE TABLE IF NOT EXISTS session_windows (";
-
 /** Ensure the additive session-key contract table inside the caller's transaction. */
 export function ensureSessionKeyContractSchemaInTransaction(db: DatabaseSync): void {
-  const start = OPENCLAW_AGENT_SCHEMA_SQL.indexOf(SESSION_KEY_CONTRACT_SCHEMA_START);
-  const end = OPENCLAW_AGENT_SCHEMA_SQL.indexOf(SESSION_KEY_CONTRACT_SCHEMA_END, start);
-  if (start === -1 || end === -1) {
-    throw new Error("OpenClaw agent session-key contract schema markers are missing.");
-  }
-  db.exec(OPENCLAW_AGENT_SCHEMA_SQL.slice(start, end)); // sqlite-allow-raw -- Idempotent additive lazy ensure.
+  db.exec(
+    extractSqliteTableSchema(OPENCLAW_AGENT_SCHEMA_SQL, "session_key_contract", {
+      endMarker: "CREATE TABLE IF NOT EXISTS session_windows (",
+      includeEndMarker: false,
+      errorMessage: "OpenClaw agent session-key contract schema markers are missing.",
+    }),
+  ); // sqlite-allow-raw -- Idempotent additive lazy ensure.
 }
 
 export function repairAndAssertOpenClawAgentV14SchemaForMigration(
@@ -280,4 +307,25 @@ function hasLegacyMemoryChunkProvenanceTrigger(db: DatabaseSync): boolean {
 
 export function hasPendingMemoryChunkMetadataMigration(db: DatabaseSync): boolean {
   return hasLegacyMemoryRecallMetadataColumns(db) || hasLegacyMemoryChunkProvenanceTrigger(db);
+}
+
+function hasPendingSessionKeyContractSchemaMigration(db: DatabaseSync): boolean {
+  const sessionNodeColumns = readSqliteTableColumns(db, "session_nodes");
+  if (!sessionNodeColumns) {
+    return false;
+  }
+  const hasContractTable = tableExists(db, "session_key_contract");
+  return !sessionNodeColumns.has("entry_valid") || !hasContractTable;
+}
+
+export function hasPendingCurrentVersionAgentDatabaseMigration(database: DatabaseSync): boolean {
+  return (
+    hasPendingMemoryChunkMetadataMigration(database) ||
+    hasPendingSessionKeyContractSchemaMigration(database) ||
+    hasRetiredAgentStateLeaseSchema(database) ||
+    hasPendingSessionConversationRouteContextColumn(database) ||
+    hasPendingSessionTranscriptContextEligibilityColumn(database) ||
+    hasPendingInputConsumptionColumnMigration(database) ||
+    hasPendingSessionProjectColumn(database)
+  );
 }

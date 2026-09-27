@@ -1,4 +1,5 @@
 import type { OpenClawConfig } from "../config/types.openclaw.js";
+import { formatErrorMessage } from "../infra/errors.js";
 import { createSubsystemLogger } from "../logging/subsystem.js";
 import { withAgentRosterFactsBatch } from "./agent-scope-config.js";
 import { listConfiguredOwnerInputs } from "./prepared-model-runtime.configured.js";
@@ -28,7 +29,7 @@ export function refreshCommittedProviderCatalogs(
     }
     void owner.snapshot?.loadFullModelCatalog?.({ changedOnly: true }).catch((error: unknown) => {
       if (!(error instanceof PreparedModelRuntimePublicationSupersededError)) {
-        log.warn(`provider catalog refresh failed: ${String(error)}`);
+        log.warn(`provider catalog refresh failed: ${formatErrorMessage(error)}`);
       }
     });
   }
@@ -92,29 +93,14 @@ export function listConfiguredRefreshInputs(
       workspacesByDir.set(agentDir, workspaceDir);
     }
   }
-  return withAgentRosterFactsBatch(config, () => {
-    const inputs: PreparedModelRuntimeInput[] = [];
-    for (const rawInput of listConfiguredOwnerInputs(
+  return withAgentRosterFactsBatch(config, () =>
+    listConfiguredOwnerInputs(
       config,
       options.defaultWorkspaceDir,
       options.allowGatewaySubagentBinding,
-    )) {
-      const input = normalizePreparedModelRuntimeInput(rawInput);
-      const preservedWorkspaceDir = input.agentId
-        ? preservedWorkspaceByAgentDir.get(input.agentId)?.get(input.agentDir)
-        : undefined;
-      inputs.push(
-        preservedWorkspaceDir
-          ? {
-              ...input,
-              workspaceDir: preservedWorkspaceDir,
-              preserveWorkspaceDirOnRefresh: true,
-            }
-          : input,
-      );
-    }
-    return inputs;
-  });
+      preservedWorkspaceByAgentDir,
+    ).map(normalizePreparedModelRuntimeInput),
+  );
 }
 
 /** Invalidates scoped owners and optionally advances retained owners to a new config stamp. */
