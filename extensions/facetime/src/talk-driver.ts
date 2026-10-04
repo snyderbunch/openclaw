@@ -2,7 +2,7 @@ import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import { formatErrorMessage } from "openclaw/plugin-sdk/error-runtime";
 import { createDeferred } from "openclaw/plugin-sdk/extension-shared";
 import type { PluginRuntime, RuntimeLogger } from "openclaw/plugin-sdk/plugin-runtime";
-import { resolveRealtimeBootstrapContextInstructions } from "openclaw/plugin-sdk/realtime-bootstrap-context";
+import { resolveRealtimeVoiceAgentContextInstructions } from "openclaw/plugin-sdk/realtime-bootstrap-context";
 import {
   createRealtimeVoiceBridgeSession,
   createTalkSessionController,
@@ -16,6 +16,7 @@ import {
   type TalkEvent,
   type TalkEventInput,
 } from "openclaw/plugin-sdk/realtime-voice";
+import { raceWithTimeout } from "openclaw/plugin-sdk/time-runtime";
 import { startFaceTimeAudioPump } from "./audio-pump.js";
 import type { FaceTimeConfig } from "./config.js";
 import { createFaceTimeConsultController } from "./talk-consult-controller.js";
@@ -154,9 +155,9 @@ export async function startFaceTimeTalkDriver(params: {
     if (failurePromise) {
       return failurePromise;
     }
-    failurePromise = Promise.resolve(params.onFailure?.(error)).then((safeToClose) => {
-      return safeToClose !== false;
-    });
+    failurePromise = Promise.resolve(params.onFailure?.(error)).then(
+      (safeToClose) => safeToClose !== false,
+    );
     return failurePromise;
   };
 
@@ -382,13 +383,10 @@ export async function startFaceTimeTalkDriver(params: {
       }
       return safeToClose;
     },
-    onPlaybackDrained() {
-      finishDrainedResponse();
-    },
+    onPlaybackDrained: finishDrainedResponse,
   });
   const providerConnect = (async () => {
     let removeAbortListener: (() => void) | undefined;
-    let readinessTimer: NodeJS.Timeout | undefined;
     const interrupted = new Promise<never>((_resolve, reject) => {
       const interrupt = () => reject(new Error("FaceTime talk startup aborted"));
       interruptProviderConnect = interrupt;
@@ -398,33 +396,21 @@ export async function startFaceTimeTalkDriver(params: {
         interrupt();
       }
     });
-    const readinessTimedOut = new Promise<never>((_resolve, reject) => {
-      readinessTimer = setTimeout(() => {
-        reject(new Error("Realtime provider was not ready within 15 seconds"));
-      }, REALTIME_READY_TIMEOUT_MS);
-      readinessTimer.unref?.();
-    });
     const prepareAndConnect = async () => {
       const providerResolution = resolveFaceTimeRealtimeProvider({
         config: params.config,
         fullConfig: params.fullConfig,
         agentId: consultAgentId,
       });
-      const bootstrapContextResolution = resolveRealtimeBootstrapContextInstructions({
+      const agentContextResolution = resolveRealtimeVoiceAgentContextInstructions({
         config: params.fullConfig,
         agentId: consultAgentId,
         sessionKey: requesterSessionKey,
-        warn: (message) =>
-          params.logger.warn?.(`[facetime] realtime bootstrap context: ${message}`),
-      }).catch((error: unknown) => {
-        params.logger.warn?.(
-          `[facetime] realtime bootstrap context unavailable: ${formatErrorMessage(error)}`,
-        );
-        return undefined;
+        warn: (message) => params.logger.warn?.(`[facetime] realtime agent context: ${message}`),
       });
       const [resolved, bootstrapContext] = await Promise.all([
         providerResolution,
-        bootstrapContextResolution,
+        agentContextResolution,
       ]);
       if (params.signal?.aborted || stopped || mediaSuspended) {
         throw new Error("FaceTime talk startup aborted");
@@ -596,12 +582,19 @@ export async function startFaceTimeTalkDriver(params: {
     try {
       // Provider connect() may return before the server's setup-complete
       // event. onReady is the contract that the session can accept audio.
-      await Promise.race([
-        Promise.all([prepareAndConnect(), providerReadyDeferred.promise]),
-        startupFailurePromise,
-        interrupted,
-        readinessTimedOut,
-      ]);
+      await raceWithTimeout(
+        () =>
+          Promise.race([
+            Promise.all([prepareAndConnect(), providerReadyDeferred.promise]),
+            startupFailurePromise,
+            interrupted,
+          ]),
+        REALTIME_READY_TIMEOUT_MS,
+        () => {
+          throw new Error("Realtime provider was not ready within 15 seconds");
+        },
+        { ref: false },
+      );
       if (startupFailure) {
         throw startupFailure;
       }
@@ -621,9 +614,6 @@ export async function startFaceTimeTalkDriver(params: {
       }
       throw normalized;
     } finally {
-      if (readinessTimer) {
-        clearTimeout(readinessTimer);
-      }
       interruptProviderConnect = undefined;
       removeAbortListener?.();
     }
@@ -656,9 +646,7 @@ export async function startFaceTimeTalkDriver(params: {
       });
       await audioReadyPromise;
     },
-    processOutputSuppressed() {
-      return pump?.processOutputSuppressed() ?? false;
-    },
+    processOutputSuppressed: pump.processOutputSuppressed,
     realtimeActive() {
       return providerReady && !mediaSuspended && !stopped;
     },

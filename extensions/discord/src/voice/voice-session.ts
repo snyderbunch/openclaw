@@ -5,8 +5,8 @@ import type { Client } from "../internal/discord.js";
 import { formatMention } from "../mentions.js";
 import { getDiscordRuntime } from "../runtime.js";
 import { DiscordAudioTransport } from "./audio-transport.js";
-import { createVoiceCaptureState, stopVoiceCaptureState } from "./capture-state.js";
-import { resolveDiscordVoiceRealtimeBootstrapContext } from "./ingress.js";
+import { stopVoiceCaptureState } from "./capture-state.js";
+import { resolveDiscordVoiceRealtimeAgentContext } from "./ingress.js";
 import type { DiscordVoiceMembershipTracker } from "./membership.js";
 import {
   createVoiceReceiveRecoveryState,
@@ -360,7 +360,7 @@ export class DiscordVoiceSessions {
       conversations: new DiscordVoiceConversationQueue(),
       audioInputBudget,
       ttsStreamFallbackWarned: false,
-      capture: createVoiceCaptureState(),
+      capture: new Map(),
       get transcripts(): VoiceSessionEntry["transcripts"] {
         return getTranscripts(entry);
       },
@@ -377,7 +377,7 @@ export class DiscordVoiceSessions {
           logger.warn("discord voice: capture failed: " + formatErrorMessage(error));
         });
       } else {
-        this.params.receive.scheduleCaptureFinalize(entry, userId, "speaker end");
+        this.params.receive.scheduleCaptureFinalize(entry, userId);
       }
     };
     const destroyedHandler = () => {
@@ -470,7 +470,7 @@ export class DiscordVoiceSessions {
     voiceMode: Exclude<DiscordVoiceMode, "stt-tts">,
     options?: { requireLiveEntry?: boolean; isCurrent?: () => boolean },
   ): Promise<{ ok: true } | { ok: false; message: string }> {
-    const bootstrapContextInstructions = await resolveDiscordVoiceRealtimeBootstrapContext({
+    const bootstrapContextInstructions = await resolveDiscordVoiceRealtimeAgentContext({
       entry,
       cfg: this.params.cfg,
       discordConfig: this.params.discordConfig,

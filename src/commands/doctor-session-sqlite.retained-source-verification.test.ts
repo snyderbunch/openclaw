@@ -25,7 +25,10 @@ import * as migrationRun from "../infra/session-sqlite-migration-manifest.js";
 import { ExitError } from "../runtime.js";
 import { closeOpenClawAgentDatabasesForTest } from "../state/openclaw-agent-db.js";
 import { withExistingOpenClawStateDatabaseReadOnly } from "../state/openclaw-state-db-readonly.js";
-import { openOpenClawStateDatabase } from "../state/openclaw-state-db.js";
+import {
+  openOpenClawStateDatabase,
+  runOpenClawStateWriteTransaction,
+} from "../state/openclaw-state-db.js";
 import { withOpenClawTestState } from "../test-utils/openclaw-test-state.js";
 import { readSessionSqliteMigrationWarnings } from "./doctor-session-sqlite-warnings.js";
 import { seedDeferredPluginSessionSource } from "./doctor-session-sqlite.deferred-plugin.test-support.js";
@@ -187,7 +190,7 @@ describe("retained session source verification", () => {
     async (history) => {
       await withOpenClawTestState({ label: "deferred-empty-index" }, async (state) => {
         openOpenClawStateDatabase({ env: state.env });
-        const cfg: OpenClawConfig = { agents: { entries: { main: { default: true } } } };
+        const cfg: OpenClawConfig = { agents: { entries: { main: {} } } };
         const directory = state.sessionsDir("main");
         fs.mkdirSync(directory, { recursive: true });
         const storePath = path.join(directory, "sessions.json");
@@ -313,7 +316,11 @@ describe("retained session source verification", () => {
         async (state) => {
           openOpenClawStateDatabase({ env: state.env });
           const cfg: OpenClawConfig = {
-            agents: { entries: { main: { default: true }, ops: {} } },
+            agents: {
+              ownership: "explicit",
+              defaults: { systemAgent: { agentId: "main" }, sessionStore: { agentId: "main" } },
+              entries: { main: {}, ops: {} },
+            },
             gateway: { mode: "local" },
           };
           const historyIds =
@@ -522,7 +529,34 @@ describe("retained session source verification", () => {
               expect(fs.existsSync(target.storePath)).toBe(false);
               for (const move of target.completedMoves) {
                 if (move.kind === "transcript") {
-                  expect(fs.readFileSync(move.sourcePath)).toEqual(originals.get(move.archivePath));
+                  if (history === "missing-index") {
+                    expect(fs.readFileSync(move.sourcePath)).toEqual(
+                      originals.get(move.archivePath),
+                    );
+                  } else {
+                    expect(fs.existsSync(move.sourcePath)).toBe(false);
+                    const settledMoves = migrationRun
+                      .listSessionSqliteMigrationManifestPaths(state.env)
+                      .flatMap(
+                        (file) =>
+                          migrationRun.readSessionSqliteMigrationManifest(file)?.targets ?? [],
+                      )
+                      .flatMap((owner) => owner.completedMoves)
+                      .filter(
+                        (settled) =>
+                          settled.sourcePath === move.sourcePath &&
+                          settled.archivePath !== move.archivePath,
+                      );
+                    expect(settledMoves).toHaveLength(1);
+                    expect(settledMoves[0]!.artifact).toMatchObject({
+                      classification: "protected",
+                      reason: "indexed-historical-primary",
+                      disposal: { state: "retained" },
+                    });
+                    expect(fs.readFileSync(settledMoves[0]!.archivePath)).toEqual(
+                      originals.get(move.archivePath),
+                    );
+                  }
                 }
               }
             }
@@ -560,6 +594,15 @@ describe("retained session source verification", () => {
         expect(archived.totals.importedEntries).toBe(0);
         expect(archived.totals.archivedTranscriptFiles).toBe(transcriptCount);
         expect(fs.existsSync(storePath)).toBe(false);
+        // Older releases left this receipt active even after its originals were archived.
+        runOpenClawStateWriteTransaction(
+          ({ db }) => {
+            db.prepare(
+              "UPDATE migration_sources SET removed_source = 0 WHERE migration_kind = 'deferred-plugin-session-import'",
+            ).run();
+          },
+          { env: state.env },
+        );
         const manifestPaths = migrationRun.listSessionSqliteMigrationManifestPaths(state.env);
         const manifestPath = archived.migrationRun!.manifestPath;
         const manifestBytes = fs.readFileSync(manifestPath);

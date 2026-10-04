@@ -16,7 +16,7 @@ import type {
   NodeSkillDescriptor,
 } from "../../packages/gateway-protocol/src/schema/nodes.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
-import { setActiveNodeContext } from "../infra/active-node-context.js";
+import { setActiveNodeContexts } from "../infra/active-node-context.js";
 import type { PairedDeviceNodeBinding } from "../infra/device-pairing-node-state.js";
 import { isPrivateNodeInvokeCommand, NODE_MCP_TOOLS_CALL_COMMAND } from "../infra/node-commands.js";
 import {
@@ -24,6 +24,7 @@ import {
   type NodeApprovalSurface,
 } from "../infra/node-pairing-surface.js";
 import { createSubsystemLogger } from "../logging/subsystem.js";
+import { enqueueKeyedTask } from "../plugin-sdk/keyed-async-queue.js";
 import { parseComputerUseCapabilityDescriptor } from "../plugins/computer-use-contract.js";
 import type { NodeHostStats } from "../shared/node-host-stats.js";
 import {
@@ -75,6 +76,8 @@ import {
 import {
   updateNodePresenceActivity,
   clearNodePresenceActivity,
+  selectActiveNode,
+  selectActiveNodesByProfile,
   type NodePresenceActivityUpdate,
 } from "./node-registry.presence.js";
 import { isNodeWorkerHostClientId } from "./node-runner-inventory-runtime.js";
@@ -508,10 +511,6 @@ export class NodeRegistry {
         })
       : connect.permissions;
     connect.permissions = permissions;
-    const pathEnv = connect.pathEnv;
-    const declaredNodePluginTools: NodePluginToolDescriptor[] = [];
-    const nodePluginTools: NodePluginToolDescriptor[] = [];
-    const nodeSkills: NodeSkillDescriptor[] = [];
     const session: PairingBoundNodeSession = {
       nodeId,
       connId: client.connId,
@@ -536,12 +535,12 @@ export class NodeRegistry {
       commands,
       ...(declaredComputerUse ? { declaredComputerUse } : {}),
       ...(computerUse ? { computerUse } : {}),
-      declaredNodePluginTools,
-      nodePluginTools,
-      nodeSkills,
+      declaredNodePluginTools: [],
+      nodePluginTools: [],
+      nodeSkills: [],
       declaredPermissions,
       permissions,
-      pathEnv,
+      pathEnv: connect.pathEnv,
       connectedAtMs: Date.now(),
     };
     // Preserve the approved declaration independently of policy, so re-enabling
@@ -856,48 +855,33 @@ export class NodeRegistry {
   getActiveNode(
     connectedNodes: readonly NodeSession[] = this.listConnected(),
   ): NodeSession | undefined {
-    let active: NodeSession | undefined;
-    for (const node of connectedNodes) {
-      if (node.lastActiveAtMs === undefined) {
-        continue;
-      }
-      if (
-        !active ||
-        node.lastActiveAtMs > (active.lastActiveAtMs ?? 0) ||
-        (node.lastActiveAtMs === active.lastActiveAtMs &&
-          (node.presenceUpdatedAtMs ?? 0) > (active.presenceUpdatedAtMs ?? 0))
-      ) {
-        active = node;
-      }
-    }
-    return active;
+    return selectActiveNode(connectedNodes);
   }
 
   private publishActiveNodeContext(): void {
-    const active = this.getActiveNode(this.listConnectedSessions()) as
-      | PairingBoundNodeSession
-      | undefined;
-    const lease = active ? this.capturePairingLease(active) : undefined;
-    setActiveNodeContext(
-      active
-        ? {
-            nodeId: active.nodeId,
-            ...(active.pairingGeneration ? { pairingGeneration: active.pairingGeneration } : {}),
-          }
-        : null,
-      lease
-        ? {
-            prepare: () => this.getCurrentConnected(lease.nodeId),
-            isCurrent: () => {
-              if (!this.currentSessionForLease(lease)) {
-                return false;
-              }
-              return this.options.isPairingStateCurrent
-                ? this.options.isPairingStateCurrent(lease.nodeId, lease.binding)
-                : true;
-            },
-          }
-        : undefined,
+    const selected = selectActiveNodesByProfile(this.listConnectedSessions());
+    setActiveNodeContexts(
+      [...selected].map(([profileId, active]) => {
+        const lease = this.capturePairingLease(active);
+        const authenticatedProfileId = active.client.authenticatedUserProfile?.profileId;
+        return {
+          nodeId: active.nodeId,
+          profileId,
+          pairingGeneration: active.pairingGeneration,
+          prepare: () => this.getCurrentConnected(lease.nodeId),
+          isCurrent: () => {
+            if (
+              !this.currentSessionForLease(lease) ||
+              active.client.authenticatedUserProfile?.profileId !== authenticatedProfileId
+            ) {
+              return false;
+            }
+            return this.options.isPairingStateCurrent
+              ? this.options.isPairingStateCurrent(lease.nodeId, lease.binding)
+              : true;
+          },
+        };
+      }),
     );
   }
 
@@ -1009,8 +993,8 @@ export class NodeRegistry {
     connId: string | undefined,
     tools: readonly NodePluginToolDescriptor[],
   ): NodeSession | null {
-    const node = this.nodesById.get(nodeId);
-    if (!node || node.connId !== connId || node.client.invalidated === true) {
+    const node = this.getRegisteredSession(nodeId);
+    if (!node || node.connId !== connId) {
       return null;
     }
     node.declaredNodePluginTools = [...tools];
@@ -1023,8 +1007,8 @@ export class NodeRegistry {
     connId: string | undefined,
     skills: readonly NodeSkillDescriptor[],
   ): NodeSession | null {
-    const node = this.nodesById.get(nodeId);
-    if (!node || node.connId !== connId || node.client.invalidated === true) {
+    const node = this.getRegisteredSession(nodeId);
+    if (!node || node.connId !== connId) {
       return null;
     }
     expectDefined(NODE_SESSION_POLICIES.get(node), "registered node policy missing").skills =
@@ -1049,10 +1033,9 @@ export class NodeRegistry {
       nextPairingGeneration: string;
     },
   ): NodeSession | null {
-    const node = this.nodesById.get(nodeId);
+    const node = this.getRegisteredSession(nodeId);
     if (
       !node ||
-      node.client.invalidated === true ||
       (generationTransition !== undefined &&
         (node.connId !== generationTransition.expectedConnId ||
           node.pairingIdentity !== generationTransition.expectedPairingIdentity ||
@@ -1337,28 +1320,18 @@ export class NodeRegistry {
     payloadJSON?: SerializedEventPayload | null,
     preparePayload?: NodeEventPayloadPreparation,
   ): Promise<boolean> {
-    const previous = this.pairingGenerationEventChains.get(nodeId) ?? Promise.resolve();
-    const send = previous.then(() =>
-      this.sendEventRawForPairingGenerationNow(
-        nodeId,
-        pairingGeneration,
-        event,
-        payloadJSON,
-        preparePayload,
-      ),
-    );
-    const tail = send.then(
-      () => undefined,
-      () => undefined,
-    );
-    this.pairingGenerationEventChains.set(nodeId, tail);
-    try {
-      return await send;
-    } finally {
-      if (this.pairingGenerationEventChains.get(nodeId) === tail) {
-        this.pairingGenerationEventChains.delete(nodeId);
-      }
-    }
+    return await enqueueKeyedTask({
+      tails: this.pairingGenerationEventChains,
+      key: nodeId,
+      task: () =>
+        this.sendEventRawForPairingGenerationNow(
+          nodeId,
+          pairingGeneration,
+          event,
+          payloadJSON,
+          preparePayload,
+        ),
+    });
   }
 
   private async sendEventRawForPairingGenerationNow(

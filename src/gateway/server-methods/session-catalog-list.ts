@@ -6,6 +6,7 @@ import {
   type SessionCatalog,
   validateSessionsCatalogListParams,
 } from "../../../packages/gateway-protocol/src/index.js";
+import { prepareShellPathFromLoginShell } from "../../infra/shell-env.js";
 import {
   capturePluginLifecycleAuthority,
   capturePluginRegistryLifecycleEpoch,
@@ -14,7 +15,7 @@ import {
 import { getPluginRuntimeGatewayRequestScope } from "../../plugins/runtime/gateway-request-scope.js";
 import type { SessionCatalogProvider } from "../../plugins/session-catalog.js";
 import { getGatewayRestartDrainSignal } from "../../process/gateway-work-admission.js";
-import { getSessionRowProjection } from "../session-row-projection-access.js";
+import { requireSessionRowProjection } from "../session-row-projection-access.js";
 import { resolveAgentIdOrRespondError } from "./agent-id-shared.js";
 import {
   createSessionCatalogRequestEntrySnapshot,
@@ -48,13 +49,6 @@ import type { GatewayRequestHandlers } from "./types.js";
 import { assertValidParams } from "./validation.js";
 
 const SESSION_CATALOG_SEARCH_MAX_UTF16_UNITS = 500;
-
-function normalizeSessionCatalogSearch(search: string | undefined): string | undefined {
-  const normalized = normalizeOptionalString(search);
-  return normalized
-    ? truncateUtf16Safe(normalized, SESSION_CATALOG_SEARCH_MAX_UTF16_UNITS)
-    : undefined;
-}
 
 type CatalogListResult = { catalogs: SessionCatalog[] };
 
@@ -127,16 +121,13 @@ export const listSessionCatalogHandler: GatewayRequestHandlers["sessions.catalog
     return;
   }
   const providerAudiences = new Map(selected.map((provider) => [provider.id, provider.audience]));
-  const projection = getSessionRowProjection(context);
-  if (!projection) {
-    throw new Error("Session projection is unavailable before Gateway startup completes");
-  }
+  const projection = requireSessionRowProjection(context);
   const diagnostics = startSessionCatalogRequestDiagnostics();
   let finishInitialProjection: (() => void) | undefined;
   try {
-    while (projection.needsMaterialization) {
+    while (projection.needsSelectionPreparation()) {
       finishInitialProjection ??= diagnostics?.startWait("projection_initial");
-      await projection.ensureMaterialized();
+      await projection.prepareSelection();
     }
   } finally {
     finishInitialProjection?.();
@@ -151,7 +142,10 @@ export const listSessionCatalogHandler: GatewayRequestHandlers["sessions.catalog
   if (!resolvedAgent) {
     return;
   }
-  const search = normalizeSessionCatalogSearch(request.search);
+  const searchInput = normalizeOptionalString(request.search);
+  const search = searchInput
+    ? truncateUtf16Safe(searchInput, SESSION_CATALOG_SEARCH_MAX_UTF16_UNITS)
+    : undefined;
   const allowHomeFallback = allowProcessHomeFallback(context.logGateway);
   // Shared provider enumeration is not permission. Each synchronous delivery gets current
   // caller facts and one canonical index, never the provider's pre-await planning snapshot.
@@ -239,7 +233,7 @@ export const listSessionCatalogHandler: GatewayRequestHandlers["sessions.catalog
         subscriber,
         isProgressCurrent,
         client?.connectionSignal ?? signal,
-        () => (projection.needsMaterialization ? projection.ensureMaterialized() : undefined),
+        () => (projection.needsSelectionPreparation() ? projection.prepareSelection() : undefined),
       );
     }
   };
@@ -256,6 +250,7 @@ export const listSessionCatalogHandler: GatewayRequestHandlers["sessions.catalog
     config,
     catalogRegistrations,
     context.requestEntryLifetime?.signal,
+    client,
   );
   const pending = operations.pending.get(listKey);
   if (pending) {
@@ -270,9 +265,9 @@ export const listSessionCatalogHandler: GatewayRequestHandlers["sessions.catalog
     }
     let finishFinalProjection: (() => void) | undefined;
     try {
-      while (projection.needsMaterialization) {
+      while (projection.needsSelectionPreparation()) {
         finishFinalProjection ??= diagnostics?.startWait("projection_final");
-        await projection.ensureMaterialized();
+        await projection.prepareSelection();
       }
     } finally {
       finishFinalProjection?.();
@@ -330,6 +325,11 @@ export const listSessionCatalogHandler: GatewayRequestHandlers["sessions.catalog
     const finishProvider = diagnostics?.startWait("provider");
     let catalogList: SessionCatalog[];
     try {
+      if (selected.length > 0) {
+        // Plugin availability callbacks retain synchronous executable resolution contracts.
+        await prepareShellPathFromLoginShell({ env: process.env });
+        progress.assertCurrent();
+      }
       catalogList = await Promise.all(
         selected.map(async (provider): Promise<SessionCatalog> => {
           const shareRoute = catalogRegistrations.shareRoutes.get(provider);
@@ -414,9 +414,9 @@ export const listSessionCatalogHandler: GatewayRequestHandlers["sessions.catalog
     const result = await operation;
     let finishFinalProjection: (() => void) | undefined;
     try {
-      while (projection.needsMaterialization) {
+      while (projection.needsSelectionPreparation()) {
         finishFinalProjection ??= diagnostics?.startWait("projection_final");
-        await projection.ensureMaterialized();
+        await projection.prepareSelection();
       }
     } finally {
       finishFinalProjection?.();
