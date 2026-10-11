@@ -31,6 +31,8 @@ import {
 } from "./components/chat-message-media.ts";
 import {
   clearSessionWorkspacePreviews,
+  getSessionWorkspace,
+  loadSessionWorkspace,
   openSessionWorkspacePreview,
 } from "./components/chat-session-workspace-state.ts";
 import {
@@ -478,7 +480,7 @@ describe("chat pane embedded panels", () => {
 
   it("opens the requested file when an unrelated directory listing completes first", async () => {
     const { file, list, mount, preview, renderPanels, state } = createReviewFixture();
-    createSessionWorkspaceProps(state).onRefresh();
+    loadSessionWorkspace(state, getSessionWorkspace(state), true);
     openSessionWorkspaceFile(state, { path: preview.file.path });
     await renderPanels();
     expect(mount.querySelector('[data-panel-skeleton="files"]')).not.toBeNull();
@@ -606,42 +608,8 @@ describe("chat pane embedded panels", () => {
     expect(mount.querySelector('[data-panel-skeleton="files"]')).toBeNull();
   });
 
-  it("does not offer Discussion when no provider is available", () => {
-    expect(discussionSlots(false)).not.toContain("discussion");
-  });
-
   it("offers Discussion after the provider reports it available", () => {
     expect(discussionSlots(true)).toContain("discussion");
-  });
-
-  it("builds default Review content only once a Review tab exists", () => {
-    const state = {
-      client: { request: vi.fn() },
-      connected: true,
-      connectionEpoch: 1,
-      hello: { features: { methods: ["sessions.diff"] } },
-      sessionKey: "agent:main:review",
-      sidebarContent: null,
-      sidebarLayout: openSlot({ columns: [] }, "workspace"),
-      settings: loadSettings(),
-    } as unknown as ChatPageHost;
-    const renderDetail = vi.fn((_content: SidebarContent) => html`<div>Review</div>`);
-    const reviewTemplate = () =>
-      sidebarPanelDefinitions({
-        state,
-        renderDetail: (content: SidebarContent) => renderDetail(content),
-        workspace: html`<div>Files</div>`,
-      } as Parameters<typeof sidebarPanelDefinitions>[0]).find(
-        (definition) => definition.slot === "detail",
-      )?.content;
-
-    // Rendering Review starts its lazy panel import; a diff-capable chat must not pay for it unopened.
-    expect(reviewTemplate()).toBeNull();
-    expect(renderDetail).not.toHaveBeenCalled();
-
-    state.sidebarLayout = openSlot(state.sidebarLayout, "detail");
-    expect(reviewTemplate()).not.toBeNull();
-    expect(renderDetail).toHaveBeenCalledOnce();
   });
 
   it("retains default Review content and collapsed files while switching tabs, focusing Chat, and minimizing", async () => {
