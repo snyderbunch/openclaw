@@ -17,7 +17,6 @@ import {
   encodeWorkerEnvironmentTransferAuthority,
 } from "./store-commit-authority.js";
 import { WorkerEnvironmentInventoryClosedError } from "./store-errors.js";
-import { assertShape } from "./store-validation.js";
 import type { WorkerEnvironmentCommitAdmission, WorkerEnvironmentFacts } from "./store.types.js";
 
 export type WorkerEnvironmentNativePatch = Partial<
@@ -54,12 +53,11 @@ function applyNativeOverlay(
 }
 
 const ownAdmission = new AsyncLocalStorage<object>();
-function createWorkerEnvironmentProjection() {
+function createWorkerEnvironmentProjection(revocationListeners = new Set<(id: string) => void>()) {
   const environments = new Map<string, WorkerEnvironmentRecord>();
   const credentials = new Map<string, WorkerCredentialRecord>();
   const attachments = new Map<string, WorkerEnvironmentAttachmentRecord>();
   const attachmentAuthorities = new Map<string, string>();
-  const revisions = new Map<string, number>();
   const nativeOverlays = new Map<string, NativeOverlay>();
   const pending = new Map<
     string,
@@ -71,11 +69,6 @@ function createWorkerEnvironmentProjection() {
       attachmentAuthorityUnchanged: boolean;
     }
   >();
-  const reconciliations = new Map<
-    object,
-    { ids: string[]; error: unknown; revocationId?: string }
-  >();
-  const revocationListeners = new Set<(environmentId: string) => void>();
   let sequence = 0;
   let version = 0;
   let active = true;
@@ -110,16 +103,15 @@ function createWorkerEnvironmentProjection() {
     credentials.clear();
     attachments.clear();
     attachmentAuthorities.clear();
-    revisions.clear();
     nativeOverlays.clear();
     pending.clear();
-    reconciliations.clear();
-    revocationListeners.clear();
     sorted = undefined;
     reconcilable = undefined;
   };
   return {
     incarnation: randomUUID(),
+    // Subscriptions belong to live store facades, across database generations.
+    revocationListeners,
     get active() {
       return active;
     },
@@ -151,14 +143,8 @@ function createWorkerEnvironmentProjection() {
       return result;
     },
     async ready() {
-      for (;;) {
-        const current = tail;
-        await current;
-        assertActive();
-        if (current === tail) {
-          return;
-        }
-      }
+      await tail;
+      assertActive();
     },
     nextSequence: () => ++sequence,
     withAdmission<T>(token: object, callback: () => T): T {
@@ -197,27 +183,12 @@ function createWorkerEnvironmentProjection() {
         });
       }
     },
-    retainReconciliation(
-      token: object,
-      ids: readonly string[],
-      error: unknown,
-      revocationId?: string,
-    ) {
-      assertActive();
-      reconciliations.set(token, { ids: [...ids], error, revocationId });
-    },
-    pendingReconciliations() {
-      assertActive();
-      return [...reconciliations].map(([token, recovery]) => Object.assign({ token }, recovery));
-    },
-    hasPendingReconciliation: () => reconciliations.size !== 0,
     release(token: object) {
       for (const [id, value] of pending) {
         if (value.token === token) {
           pending.delete(id);
         }
       }
-      reconciliations.delete(token);
     },
     onCredentialRevoked(listener: (environmentId: string) => void) {
       assertActive();
@@ -234,7 +205,7 @@ function createWorkerEnvironmentProjection() {
     install(facts: WorkerEnvironmentFacts, revision: number, notify = true) {
       assertActive();
       // Worker replies already own their rows; freeze each published revision for shared reads.
-      const changed = new Set(facts.ids.filter((id) => revision >= (revisions.get(id) ?? -1)));
+      const changed = new Set(facts.ids);
       const retainedSessions = new Set(
         facts.attachments
           .filter((row) => changed.has(row.environmentId))
@@ -244,7 +215,6 @@ function createWorkerEnvironmentProjection() {
         environments.delete(id);
         credentials.delete(id);
         attachmentAuthorities.delete(id);
-        revisions.set(id, revision);
       }
       for (const [session, attachment] of attachments) {
         if (changed.has(attachment.environmentId) && !retainedSessions.has(session)) {
@@ -300,9 +270,6 @@ function createWorkerEnvironmentProjection() {
     },
     publishPatch(id: string, patch: WorkerEnvironmentNativePatch, revision: number) {
       assertActive();
-      if (revision <= (revisions.get(id) ?? -1)) {
-        return;
-      }
       const captured = freezeJsonSnapshot(structuredClone(patch));
       const previous = nativeOverlays.get(id);
       const overlay: NativeOverlay = {
@@ -369,11 +336,7 @@ function createWorkerEnvironmentProjection() {
     },
     get(id: string) {
       assertReadable(id, "environment");
-      const record = environments.get(id);
-      if (record) {
-        assertShape(record);
-      }
-      return record;
+      return environments.get(id);
     },
     transferOwner(id: string) {
       assertReadable(id, "transfer");
@@ -416,7 +379,6 @@ function createWorkerEnvironmentProjection() {
       assertActive();
       sorted ??= freezeJsonSnapshot([...environments.values()].toSorted(compare));
       if (!reconcile) {
-        sorted.forEach(assertShape);
         return sorted;
       }
       reconcilable ??= freezeJsonSnapshot(
@@ -427,7 +389,6 @@ function createWorkerEnvironmentProjection() {
               Buffer.compare(Buffer.from(a.providerId), Buffer.from(b.providerId)) || compare(a, b),
           ),
       );
-      reconcilable.forEach(assertShape);
       return reconcilable;
     },
     hasSessionAttachment(environmentId: string) {
@@ -458,7 +419,7 @@ function createWorkerEnvironmentProjection() {
 function createWorkerEnvironmentProjectionRegistry() {
   type Owner = ReturnType<typeof createWorkerEnvironmentProjection>;
   const owners = new Map<string, { owner: Owner; identity: () => DatabasePathIdentity }>();
-  const get = (identity: DatabasePathIdentity): Owner | undefined => {
+  const get = (identity: DatabasePathIdentity, includeRetired = false): Owner | undefined => {
     for (const [key, entry] of owners) {
       const current = entry.identity();
       if (
@@ -468,8 +429,7 @@ function createWorkerEnvironmentProjectionRegistry() {
       ) {
         continue;
       }
-      if (!entry.owner.active) {
-        owners.delete(key);
+      if (!entry.owner.active && !includeRetired) {
         return undefined;
       }
       // First creation promotes the existing admission even through another filesystem alias.
@@ -483,7 +443,7 @@ function createWorkerEnvironmentProjectionRegistry() {
   };
   const remove = (owner: Owner) => {
     for (const [key, entry] of owners) {
-      if (entry.owner === owner) {
+      if (entry.owner === owner && owner.revocationListeners.size === 0) {
         owners.delete(key);
       }
     }
@@ -492,11 +452,11 @@ function createWorkerEnvironmentProjectionRegistry() {
     get,
     acquire(identity: () => DatabasePathIdentity): Owner {
       const current = identity();
-      const existing = get(current);
-      if (existing) {
+      const existing = get(current, true);
+      if (existing?.active) {
         return existing;
       }
-      const owner = createWorkerEnvironmentProjection();
+      const owner = createWorkerEnvironmentProjection(existing?.revocationListeners);
       owners.set(current.key, { owner, identity });
       return owner;
     },
@@ -507,11 +467,11 @@ function createWorkerEnvironmentProjectionRegistry() {
         return;
       }
       owner.close();
-      remove(owner);
     },
     close() {
       for (const { owner } of owners.values()) {
         owner.close();
+        owner.revocationListeners.clear();
       }
       owners.clear();
     },
