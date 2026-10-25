@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { pipeline } from "node:stream/promises";
+import type { MessagePort } from "node:worker_threads";
 import zlib from "node:zlib";
 import { requireDirectorySync, syncDirectorySync } from "../../infra/directory-durability.js";
 import { hasErrnoCode } from "../../infra/errno.js";
@@ -15,13 +16,12 @@ import {
   sqliteSessionIdWriteScope,
   withSqliteDatabaseWriteScope,
 } from "../../infra/sqlite-database-admission.js";
-import { runSqliteDeferredTransactionSync } from "../../infra/sqlite-transaction.js";
+import { runSqliteReadSnapshotSync } from "../../infra/sqlite-transaction.js";
 import { withOpenClawAgentDatabaseReadOnly } from "../../state/openclaw-agent-db-readonly.js";
 import type { DB } from "../../state/openclaw-agent-db.generated.js";
 import {
   runOpenClawAgentWriteTransaction,
   type OpenClawAgentDatabase,
-  type OpenClawAgentDatabaseOptions,
 } from "../../state/openclaw-agent-db.js";
 import { readSessionGoalOperationInDatabase } from "./goals-operations.js";
 import { publishEncodedSessionTranscriptArchive } from "./session-accessor.sqlite-archive-artifact.js";
@@ -41,7 +41,6 @@ import {
 } from "./session-cold-storage-codec.js";
 import { readSessionColdStorageProtection } from "./session-cold-storage-eligibility.js";
 import type { SessionColdRestorationGuard } from "./session-cold-storage-guard.types.js";
-import { readSessionColdStorageInventory } from "./session-cold-storage-inventory.js";
 import {
   readSessionAdmissionProtectionKeys,
   selectSessionColdBatch,
@@ -115,11 +114,16 @@ export type SessionColdMutationPlan = { databaseOptions: SessionColdPlan["databa
     }
 );
 export type SessionColdWorkerData = {
-  type: "sqlite-transcript-archive-v2";
-  operation: "cold-mutate";
   commitGate: SharedArrayBuffer;
   sourceMatches?: SessionColdSourceMatches;
   plan: SessionColdMutationPlan;
+};
+
+export type SqliteArchiveMutationRequest = {
+  type: "cold-mutation";
+  operationId: number;
+  data: SessionColdWorkerData;
+  port: MessagePort;
 };
 
 async function prepareSessionColdArchiveInWorker(
@@ -156,7 +160,7 @@ async function prepareSessionColdArchiveInWorker(
       };
       const opened = withOpenClawAgentDatabaseReadOnly(
         (database) =>
-          runSqliteDeferredTransactionSync(
+          runSqliteReadSnapshotSync(
             database.db,
             () => {
               if (
@@ -406,7 +410,7 @@ export async function prepareSessionColdBatchInWorker(
   if (included.length > 0) {
     const protection = withOpenClawAgentDatabaseReadOnly(
       (database) =>
-        runSqliteDeferredTransactionSync(
+        runSqliteReadSnapshotSync(
           database.db,
           () => [...readSessionAdmissionProtectionKeys(database, included)],
           { databaseLabel: database.path, operationLabel: "cold admission protection" },
@@ -690,20 +694,4 @@ export function mutateSessionColdTranscriptInWorker(
     plan.databaseOptions,
     { operationLabel: "session cold storage" },
   );
-}
-
-export function readSessionColdStorageInventoryInWorker(options: OpenClawAgentDatabaseOptions) {
-  const counts = withOpenClawAgentDatabaseReadOnly(readSessionColdStorageInventory, options);
-  return counts.found ? counts.value : readSessionColdStorageInventory();
-}
-
-export function readSessionColdMetadataInWorker(
-  options: OpenClawAgentDatabaseOptions,
-  sessionId: string,
-) {
-  const result = withOpenClawAgentDatabaseReadOnly(
-    (database) => readSessionColdTranscript(database.db, sessionId),
-    options,
-  );
-  return result.found ? result.value : undefined;
 }
